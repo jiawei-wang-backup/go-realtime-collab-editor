@@ -42,6 +42,9 @@
 | --- | --- |
 | 实时通信 | CLI 使用 Native QUIC；浏览器优先 WebTransport、WebSocket 兼容回退；共用协议与 Room 流程 |
 | 浏览器编辑器 | React、TypeScript、Monaco Editor、Zustand、IndexedDB Pending 恢复 |
+| 工作区导航 | 多级文件树、文档搜索和快速打开（`⌘P` / `Ctrl+P`） |
+| 文件与文件夹共享 | 直接授权、目录权限继承、按用户撤权和移动前权限预览 |
+| 版本历史 | 浏览已保存的版本，并与当前编辑器内容并排对比 |
 | Go 代码运行 | 将 Monaco 当前文本交给经认证的 Docker 隔离 Runner 执行 |
 | 协作编辑 | Versioned Operational Transformation，支持 Insert/Delete |
 | 协作光标 | 经认证、感知 Version 的远程光标与选区，使用 Monaco Decoration 渲染 |
@@ -201,6 +204,14 @@ Go 代码执行与协作数据链路完全分离：`Execution API → Runner →
 
 **原因与保证：** Cursor 状态保存在单 goroutine Room 内，并与 Edit 一样遵循 Owner Redirect，但不会增加文档 Version，也不会写入 MySQL、Snapshot 或 Operation Log。已接受的 Edit 会转换已有 Cursor 位置；非法或与 ACK 交错产生的临时旧消息会被丢弃，不降低 Edit、Ownership 或 Fencing 校验强度。
 
+### 4.11 工作区、共享与版本历史
+
+浏览器工作区使用多级文件夹组织文档。所有者可以重命名和移动文件或文件夹，也可以删除空文件夹。文档改名或移动后仍使用原 ID，已有链接和版本历史继续有效。
+
+文件和文件夹的所有者可以按用户授予、修改或撤销直接权限。文件夹的授权适用于现有及后续新增的下级目录和文件。共享面板会显示继承权限的来源，移动预览会在确认前展示实际访问权限的变化。
+
+可以从文件树打开文档，也可以在编辑器内使用快速打开。切换文件前会等待待确认的编辑保存到本地。历史面板从 MySQL 读取旧版本，并和当前编辑器内容并排展示。
+
 ## 5. 技术栈
 
 以下版本均来自当前仓库配置。
@@ -302,6 +313,8 @@ source .env
 set +a
 go run ./cmd/migrate
 ```
+
+体验文件夹管理和版本历史时请使用 MySQL。如果已有数据库，重新运行迁移命令以应用[文件夹迁移](migrations/004_folders.sql)。
 
 ### 启动服务端
 
@@ -457,6 +470,7 @@ terraform -chdir=deploy/gcp plan -refresh=false
 - WebTransport 要求 Secure Context、HTTP/3 UDP 可达和可验证的服务端身份。由于浏览器无法稳定地区分 TLS/Origin 策略失败与普通建连失败，自动回退特意限制为“浏览器没有 WebTransport API”；兼容性需要时可由部署配置显式选择 WebSocket。
 - OT 是线性文本 OT-lite，不是完整 CRDT。浏览器编辑会写入 IndexedDB 并按顺序重放，但复杂的客户端多操作 Rebase 仍有限制。
 - MySQL Operation Log 仍为追加写入，尚未实现长期归档策略。
+- 版本历史支持浏览和对比。恢复旧版本和多人协作时仅撤销自己的编辑尚未实现。
 - 第一版多节点部署采用稳定节点身份，不包含自动扩缩容、自动证书签发或健康 Room 主动迁移。
 - Google Cloud 尚未部署；Terraform 验证不能替代真实配额、IAM、证书、DNS 和网络验证。
 - Phase 8.9 是短时小规模测试，不代表生产峰值容量、跨区域延迟或长期内存稳定性。

@@ -42,6 +42,9 @@ The sign-in screen presents the product's visual identity while keeping the pass
 | --- | --- |
 | Real-time Communication | Native QUIC for CLI clients; WebTransport preferred and WebSocket fallback for browsers; one shared protocol and Room path |
 | Browser Editor | React, TypeScript, Monaco Editor, Zustand, IndexedDB pending recovery |
+| Workspace Navigation | Nested file tree, document search, and Quick Open (`⌘P` / `Ctrl+P`) |
+| File and Folder Sharing | Direct grants, inherited folder access, per-user revocation, and access previews before moves |
+| Version History | Browse saved versions and compare a historical version with the current editor content |
 | Go Code Execution | Live Monaco source executed by an authenticated, Docker-isolated Runner |
 | Collaborative Editing | Versioned Operational Transformation with Insert/Delete |
 | Collaborative Presence | Authenticated, version-aware remote cursors and selections rendered with Monaco decorations |
@@ -201,6 +204,14 @@ Go execution is deliberately outside the collaboration data path: `Execution API
 
 **Rationale and guarantees:** Cursor state stays inside the single-goroutine Room and follows the same Owner Redirect path as edits, but it never increments document version or writes MySQL, snapshots, or operation logs. Accepted edits transform stored cursor positions. Invalid or crossed-in-flight transient updates are discarded without weakening edit, ownership, or fencing validation.
 
+### 4.11 Workspace, Sharing, and History
+
+The browser workspace organizes documents in nested folders. Owners can rename and move files or folders and delete empty folders. A document keeps its ID when renamed or moved, so existing links and version history stay with it.
+
+File and folder owners can grant, change, or revoke a user's direct access. Folder grants apply to existing and future descendants. The sharing panel shows where inherited access comes from, and the move preview shows how effective access would change before the move is confirmed.
+
+Open a document from the tree or use Quick Open inside the editor. File switches wait for pending edits to be saved locally. The History panel loads earlier versions from MySQL and displays the selected version next to the current editor content.
+
 ## 5. Technology Stack
 
 Versions below are read from the current repository configuration.
@@ -302,6 +313,8 @@ source .env
 set +a
 go run ./cmd/migrate
 ```
+
+Use MySQL to try folder management and version history. For an existing database, rerun the migration command to apply [the folder migration](migrations/004_folders.sql).
 
 ### Server Startup
 
@@ -457,6 +470,7 @@ Do not apply without an approved plan, budget, and rollback procedure.
 - WebTransport requires a secure context, HTTP/3 UDP reachability, and a verified server identity. Automatic fallback is deliberately limited to browsers without the WebTransport API because browsers do not reliably distinguish TLS or Origin policy failures from ordinary connection failures; deployments can explicitly select WebSocket when compatibility requires it.
 - OT is a linear-text OT-lite implementation, not a full CRDT. Browser edits are stored in IndexedDB and replayed sequentially; complex client-side multi-operation rebasing remains limited.
 - The MySQL operation log is append-only and does not yet have a long-term archival policy.
+- Version history supports browsing and comparison. Restoring a historical version and undoing only your own edits during a shared session are not implemented.
 - The initial multi-node deployment assumes stable node identities; it does not automate scaling, certificate issuance, or proactive migration of healthy Rooms.
 - Google Cloud has not been deployed. Terraform validation cannot replace real quota, IAM, certificate, DNS, and network verification.
 - Phase 8.9 was a short, small-scale test and does not establish production peak capacity, cross-region latency, or long-term memory stability.
