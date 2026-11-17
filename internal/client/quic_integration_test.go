@@ -18,17 +18,19 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/authentication"
+	jwtauth "github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/adapter/jwt"
+	memoryauth "github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/adapter/memory/authentication"
+	memory "github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/adapter/memory/documents"
+	mysqlstorage "github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/adapter/mysql"
+	redisauth "github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/adapter/redis"
+	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/app/authentication"
+	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/app/room"
 	clientstorage "github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/client/storage"
-	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/collab"
+	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/domain/collab"
+	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/domain/permission"
 	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/migration"
-	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/permission"
 	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/protocol"
-	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/room"
-	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/storage"
-	mysqlstorage "github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/storage/mysql"
 	quictransport "github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/transport/quic"
-
 	"github.com/redis/go-redis/v9"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -63,13 +65,13 @@ func TestFullCrashRecoveryWithMySQLRedisQUICAndSQLite(t *testing.T) {
 	if err := migration.Run(ctx, mysqlStore.DB(), "../../migrations"); err != nil {
 		t.Fatal(err)
 	}
-	sessions, err := authentication.NewRedisSessions(ctx, &redis.Options{Addr: redisAddress, Password: os.Getenv("REDIS_TEST_PASSWORD"), DB: 14})
+	sessions, err := redisauth.NewRedisSessions(ctx, &redis.Options{Addr: redisAddress, Password: os.Getenv("REDIS_TEST_PASSWORD"), DB: 14})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer sessions.Close()
-	jwtTokens, _ := authentication.NewTokenManager(authentication.JWTConfig{Secret: []byte("0123456789abcdef0123456789abcdef"), Issuer: "full-test", Audience: "full-test", AccessTTL: time.Hour})
-	service := authentication.NewService(authentication.NewMySQLUsers(mysqlStore.DB()), sessions, jwtTokens, authentication.ServiceConfig{
+	jwtTokens, _ := jwtauth.NewTokenManager(jwtauth.JWTConfig{Secret: []byte("0123456789abcdef0123456789abcdef"), Issuer: "full-test", Audience: "full-test", AccessTTL: time.Hour})
+	service := authentication.NewService(mysqlstorage.NewMySQLUsers(mysqlStore.DB()), sessions, jwtTokens, authentication.ServiceConfig{
 		RefreshTTL: time.Hour, ReplayEncryptionKey: []byte("abcdef0123456789abcdef0123456789"), BcryptCost: bcrypt.MinCost,
 	})
 	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
@@ -175,9 +177,9 @@ func TestFullCrashRecoveryWithMySQLRedisQUICAndSQLite(t *testing.T) {
 
 func TestRealQUICManagerReconnectsResumesAndReceivesOfflineEdit(t *testing.T) {
 	serverTLS, clientTLS := reliabilityTLSConfigs(t)
-	users := authentication.NewMemoryUsers()
-	sessions := authentication.NewMemorySessions()
-	jwtTokens, err := authentication.NewTokenManager(authentication.JWTConfig{
+	users := memoryauth.NewMemoryUsers()
+	sessions := memoryauth.NewMemorySessions()
+	jwtTokens, err := jwtauth.NewTokenManager(jwtauth.JWTConfig{
 		Secret: []byte("0123456789abcdef0123456789abcdef"), Issuer: "client-test", Audience: "client-test", AccessTTL: time.Hour,
 	})
 	if err != nil {
@@ -192,7 +194,7 @@ func TestRealQUICManagerReconnectsResumesAndReceivesOfflineEdit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	store := storage.NewMemory()
+	store := memory.NewMemory()
 	if _, err := store.CreateDocument(context.Background(), "doc", "", user.ID); err != nil {
 		t.Fatal(err)
 	}

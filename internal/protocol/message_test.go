@@ -2,9 +2,9 @@ package protocol
 
 import (
 	"encoding/json"
-
-	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/permission"
 	"testing"
+
+	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/domain/permission"
 )
 
 func TestJoinedMessageIncludesZeroVersionAndEmptyContent(t *testing.T) {

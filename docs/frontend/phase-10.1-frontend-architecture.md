@@ -4,7 +4,7 @@ Date: 2026-11-08 (Australia/Melbourne)
 
 ## Scope and source of truth
 
-This document is based on the current Go implementation, not only the project README. The reviewed boundaries are `internal/api`, `internal/authentication`, `internal/protocol`, `internal/room`, `internal/transport/quic`, `internal/client`, `internal/storage`, `internal/cluster`, and `cmd/server`.
+This document is based on the current Go implementation, not only the project README. The reviewed boundaries are `internal/transport/http`, `internal/app/authentication`, `internal/protocol`, `internal/app/room`, `internal/transport/quic`, `internal/client`, `internal/domain/storage`, `internal/app/cluster`, and `cmd/service`.
 
 The frontend must reuse the existing Room, OT, ownership, fencing, persistence, and session rules. It must not introduce a second collaboration engine.
 

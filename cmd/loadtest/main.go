@@ -18,8 +18,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/collab"
-	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/permission"
+	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/domain/collab"
+	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/domain/permission"
 	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/protocol"
 	quictransport "github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/transport/quic"
 )

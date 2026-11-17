@@ -156,8 +156,8 @@ test('two real browser contexts collaborate, recover pending edits, refresh, and
     await shareDialog.getByRole('button', { name: 'Done' }).click()
 
     await pageB.reload()
-    await expect(pageB.getByText(documentId, { exact: true })).toBeVisible()
-    await pageB.getByText(documentId, { exact: true }).click()
+    await expect(pageB.getByRole('button', { name: documentId, exact: true })).toBeVisible()
+    await pageB.getByRole('button', { name: documentId, exact: true }).click()
     await expect(pageB.locator('.connection-connected')).toBeVisible()
     await expect(pageA.locator('.participant')).toHaveCount(2)
     await expect(pageB.locator('.participant')).toHaveCount(2)
@@ -183,7 +183,7 @@ test('two real browser contexts collaborate, recover pending edits, refresh, and
     // Leaving the document removes its cursor; reopening publishes a fresh one.
     await pageA.goto('/')
     await expect(pageB.locator('.remote-cursor-label')).toHaveCount(0)
-    await pageA.getByText(documentId, { exact: true }).click()
+    await pageA.getByRole('button', { name: documentId, exact: true }).click()
     await expect(pageA.locator('.connection-connected')).toBeVisible()
     await focusEditor(pageA)
     await pageA.keyboard.press('ControlOrMeta+Home')

@@ -9,7 +9,7 @@ import (
 	"regexp"
 	"testing"
 
-	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/collab"
+	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/domain/collab"
 )
 
 var tokenColumnPattern = regexp.MustCompile(`(?i)(access|refresh)[_-]?token`)

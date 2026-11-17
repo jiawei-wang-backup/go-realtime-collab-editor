@@ -3,8 +3,8 @@ package protocol
 import (
 	"encoding/json"
 
-	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/collab"
-	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/permission"
+	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/domain/collab"
+	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/domain/permission"
 )
 
 const (

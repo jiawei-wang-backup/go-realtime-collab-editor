@@ -25,6 +25,6 @@ printf 'This replaces the demo database contents. Type exactly %q: ' "$expected"
 IFS= read -r confirmation
 [[ "$confirmation" == "$expected" ]] || { printf 'Restore cancelled.\n'; exit 1; }
 
-remote_command="sudo docker compose --env-file '$DEMO_REMOTE_STATE/runtime.env' -f '$DEMO_REMOTE_ROOT/deploy/demo/docker-compose.demo.yml' exec -T mysql sh -c 'exec mysql --user=root --password=\"\$MYSQL_ROOT_PASSWORD\" \"\$MYSQL_DATABASE\"'"
+remote_command="sudo docker compose --env-file '$DEMO_REMOTE_STATE/runtime.env' -f '$DEMO_REMOTE_ROOT/deployments/demo/docker-compose.demo.yml' exec -T mysql sh -c 'exec mysql --user=root --password=\"\$MYSQL_ROOT_PASSWORD\" \"\$MYSQL_DATABASE\"'"
 gzip -dc "$backup_file" | gcloud_ssh --command="$remote_command"
 printf 'Restore completed from %s\n' "$backup_file"

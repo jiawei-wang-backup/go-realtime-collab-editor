@@ -22,7 +22,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-remote_command="sudo docker compose --env-file '$DEMO_REMOTE_STATE/runtime.env' -f '$DEMO_REMOTE_ROOT/deploy/demo/docker-compose.demo.yml' exec -T mysql sh -c 'exec mysqldump --user=root --password=\"\$MYSQL_ROOT_PASSWORD\" --single-transaction --routines --events --triggers --set-gtid-purged=OFF \"\$MYSQL_DATABASE\"'"
+remote_command="sudo docker compose --env-file '$DEMO_REMOTE_STATE/runtime.env' -f '$DEMO_REMOTE_ROOT/deployments/demo/docker-compose.demo.yml' exec -T mysql sh -c 'exec mysqldump --user=root --password=\"\$MYSQL_ROOT_PASSWORD\" --single-transaction --routines --events --triggers --set-gtid-purged=OFF \"\$MYSQL_DATABASE\"'"
 gcloud_ssh --command="$remote_command" >"$tmp_file"
 
 if [[ ! -s "$tmp_file" ]] || ! grep -q '^-- MySQL dump' "$tmp_file" || ! grep -q '^-- Dump completed on' "$tmp_file"; then

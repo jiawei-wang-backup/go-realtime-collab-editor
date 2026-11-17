@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/collab"
+	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/domain/collab"
 	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/protocol"
 )
 

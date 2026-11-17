@@ -3,7 +3,7 @@ package clientstorage
 import (
 	"time"
 
-	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/collab"
+	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/domain/collab"
 )
 
 type Document struct {

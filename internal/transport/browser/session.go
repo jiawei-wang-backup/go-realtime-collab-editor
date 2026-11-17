@@ -11,11 +11,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/authentication"
-	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/cluster"
+	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/app/authentication"
+	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/app/room"
+	identity "github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/domain/authentication"
+	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/domain/cluster"
 	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/protocol"
-	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/room"
-	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/transport"
 )
 
 const cursorMessagesPerSecond = 30
@@ -57,7 +57,7 @@ func Serve(parent context.Context, connection MessageConn, config Config) {
 type sessionClient struct {
 	connection     MessageConn
 	config         Config
-	principal      authentication.Principal
+	principal      identity.Principal
 	room           *room.Room
 	docID          string
 	send           chan protocol.Message
@@ -70,7 +70,7 @@ type sessionClient struct {
 	cursorMessages int
 }
 
-var _ transport.Client = (*sessionClient)(nil)
+var _ room.Connection = (*sessionClient)(nil)
 
 func (client *sessionClient) Identity() string       { return client.principal.UserID }
 func (client *sessionClient) SupportsPresence() bool { return true }
@@ -159,7 +159,7 @@ func (client *sessionClient) authenticate(parent context.Context) bool {
 	}
 	client.principal = principal
 	if client.config.ConnectionRegistry != nil {
-		client.unregister = client.config.ConnectionRegistry.Register(principal.SessionID, client, func() { client.Close(authentication.ErrSessionInvalid) })
+		client.unregister = client.config.ConnectionRegistry.Register(principal.SessionID, client, func() { client.Close(identity.ErrSessionInvalid) })
 	}
 	return client.TrySend(protocol.Message{Type: protocol.TypeAuthOK})
 }

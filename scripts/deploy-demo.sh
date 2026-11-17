@@ -62,8 +62,8 @@ tar -C "$DEMO_REPO_ROOT" -czf "$archive" \
   --exclude='frontend/dist' \
   --exclude='frontend/test-results' \
   --exclude='frontend/playwright-report' \
-  --exclude='deploy/demo-gcp/.terraform' \
-  --exclude='deploy/demo-gcp/*.tfstate*' \
+  --exclude='*/.terraform' \
+  --exclude='*.tfstate*' \
   .
 gcloud_scp "$archive" "$DEMO_VM_NAME:/tmp/collab-demo-source.tar.gz"
 gcloud_ssh --command="sudo rm -rf '$DEMO_REMOTE_ROOT' && sudo install -d -m 0755 '$DEMO_REMOTE_ROOT' && sudo tar -xzf /tmp/collab-demo-source.tar.gz -C '$DEMO_REMOTE_ROOT' && sudo rm -f /tmp/collab-demo-source.tar.gz && sudo DEMO_REMOTE_ROOT='$DEMO_REMOTE_ROOT' DEMO_REMOTE_STATE='$DEMO_REMOTE_STATE' '$DEMO_REMOTE_ROOT/scripts/prepare-demo-host.sh'"

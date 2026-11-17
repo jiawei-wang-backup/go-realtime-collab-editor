@@ -135,10 +135,11 @@ chmod 600 "$TEMP_DIR"/*-key.pem
 WT_HASH=$("$OPENSSL3" x509 -in "$TEMP_DIR/webtransport.pem" -outform DER | "$OPENSSL3" dgst -sha256 -binary | "$OPENSSL3" base64 -A)
 
 docker network create --label "com.collab-editor.test-run=$SUFFIX" "$NETWORK" >/dev/null
+# The Go service applies and records migrations when it starts.
 docker run -d --name "$MYSQL_CONTAINER" --network "$NETWORK" --label "com.collab-editor.test-run=$SUFFIX" \
   -p "127.0.0.1:$MYSQL_PORT:3306" \
   -e "MYSQL_ROOT_PASSWORD=$MYSQL_ROOT_PASSWORD" -e MYSQL_DATABASE=collab_editor -e MYSQL_USER=collab -e "MYSQL_PASSWORD=$MYSQL_PASSWORD" \
-  -v "$ROOT/migrations:/docker-entrypoint-initdb.d:ro" mysql:8.4.13 >/dev/null
+  mysql:8.4.13 >/dev/null
 CONTAINERS+=("$MYSQL_CONTAINER")
 docker run -d --name "$REDIS_CONTAINER" --network "$NETWORK" --label "com.collab-editor.test-run=$SUFFIX" \
   -p "127.0.0.1:$REDIS_PORT:6379" redis:7.4.5-alpine redis-server --save '' --appendonly no --requirepass "$REDIS_PASSWORD" >/dev/null
@@ -154,7 +155,7 @@ wait_for MYSQL docker exec "$MYSQL_CONTAINER" sh -c 'MYSQL_PWD="$MYSQL_ROOT_PASS
 wait_for REDIS docker exec "$REDIS_CONTAINER" redis-cli -a "$REDIS_PASSWORD" ping
 wait_for ETCD docker exec "$ETCD_CONTAINER" etcdctl --endpoints=https://127.0.0.1:2379 --cacert=/certs/ca.pem --cert=/certs/client.pem --key=/certs/client-key.pem endpoint health
 
-go build -o "$TEMP_DIR/collab-server" ./cmd/server
+go build -o "$TEMP_DIR/collab-server" ./cmd/service
 
 COMMON=(
   "APP_ENV=development" "STORAGE_DRIVER=mysql" "MYSQL_DSN=collab:${MYSQL_PASSWORD}@tcp(127.0.0.1:${MYSQL_PORT})/collab_editor?charset=utf8mb4&parseTime=true&loc=UTC"
@@ -184,9 +185,9 @@ NODE_B_PID=$!
 wait_for 'NODE A' curl -fsS "http://127.0.0.1:$ADMIN_A/readyz"
 wait_for 'NODE B' curl -fsS "http://127.0.0.1:$ADMIN_B/readyz"
 
-(cd frontend && VITE_BACKEND_URL="http://127.0.0.1:$REST_A" VITE_REALTIME_TRANSPORT=webtransport VITE_WEBTRANSPORT_URLS="https://127.0.0.1:$WT_A/api/webtransport,https://127.0.0.1:$WT_B/api/webtransport" VITE_WEBTRANSPORT_CERT_SHA256="$WT_HASH" npm run dev -- --host 127.0.0.1 --port "$VITE_A") >"$TEMP_DIR/vite-a.log" 2>&1 &
+(cd frontend && exec env VITE_BACKEND_URL="http://127.0.0.1:$REST_A" VITE_REALTIME_TRANSPORT=webtransport VITE_WEBTRANSPORT_URLS="https://127.0.0.1:$WT_A/api/webtransport,https://127.0.0.1:$WT_B/api/webtransport" VITE_WEBTRANSPORT_CERT_SHA256="$WT_HASH" ./node_modules/.bin/vite --host 127.0.0.1 --port "$VITE_A") >"$TEMP_DIR/vite-a.log" 2>&1 &
 PIDS+=("$!")
-(cd frontend && VITE_BACKEND_URL="http://127.0.0.1:$REST_B" VITE_REALTIME_TRANSPORT=webtransport VITE_WEBTRANSPORT_URLS="https://127.0.0.1:$WT_B/api/webtransport,https://127.0.0.1:$WT_A/api/webtransport" VITE_WEBTRANSPORT_CERT_SHA256="$WT_HASH" npm run dev -- --host 127.0.0.1 --port "$VITE_B") >"$TEMP_DIR/vite-b.log" 2>&1 &
+(cd frontend && exec env VITE_BACKEND_URL="http://127.0.0.1:$REST_B" VITE_REALTIME_TRANSPORT=webtransport VITE_WEBTRANSPORT_URLS="https://127.0.0.1:$WT_B/api/webtransport,https://127.0.0.1:$WT_A/api/webtransport" VITE_WEBTRANSPORT_CERT_SHA256="$WT_HASH" ./node_modules/.bin/vite --host 127.0.0.1 --port "$VITE_B") >"$TEMP_DIR/vite-b.log" 2>&1 &
 PIDS+=("$!")
 wait_for 'VITE A' curl -fsS "http://127.0.0.1:$VITE_A/auth"
 wait_for 'VITE B' curl -fsS "http://127.0.0.1:$VITE_B/auth"

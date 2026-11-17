@@ -9,7 +9,7 @@ import (
 	"time"
 
 	clientstorage "github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/client/storage"
-	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/collab"
+	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/domain/collab"
 	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/protocol"
 )
 

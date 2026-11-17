@@ -11,7 +11,7 @@ repo_root="${DEMO_REMOTE_ROOT:-/opt/collab-demo}"
 state_root="${DEMO_REMOTE_STATE:-/opt/collab-demo-state}"
 cert_dir="$state_root/certs"
 env_file="$state_root/runtime.env"
-compose_file="$repo_root/deploy/demo/docker-compose.demo.yml"
+compose_file="$repo_root/deployments/demo/docker-compose.demo.yml"
 
 require_command() {
   command -v "$1" >/dev/null 2>&1 || { printf 'Required command not found: %s\n' "$1" >&2; exit 1; }

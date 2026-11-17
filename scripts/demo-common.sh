@@ -4,7 +4,7 @@ set -euo pipefail
 
 DEMO_REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck disable=SC2034 # Consumed by scripts that source this file.
-DEMO_TF_DIR="$DEMO_REPO_ROOT/deploy/demo-gcp"
+DEMO_TF_DIR="$DEMO_REPO_ROOT/deployments/demo-gcp"
 DEMO_VM_NAME="${DEMO_VM_NAME:-collab-public-demo-vm}"
 GCP_REGION="${GCP_REGION:-us-central1}"
 GCP_ZONE="${GCP_ZONE:-us-central1-a}"

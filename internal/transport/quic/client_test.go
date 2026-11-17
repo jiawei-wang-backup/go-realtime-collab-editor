@@ -8,17 +8,16 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/authentication"
+	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/app/room"
+	identity "github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/domain/authentication"
 	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/protocol"
-	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/transport"
-
 	quic "github.com/quic-go/quic-go"
 )
 
 func TestClientImplementsTransportAndNonBlockingQueue(t *testing.T) {
-	var _ transport.Client = (*Client)(nil)
+	var _ room.Connection = (*Client)(nil)
 	client := &Client{
-		principal:  authentication.Principal{UserID: "user"},
+		principal:  identity.Principal{UserID: "user"},
 		send:       make(chan protocol.Message, 1),
 		connection: &fakeConnection{},
 		stream:     &fakeStream{},
@@ -42,7 +41,7 @@ func TestClientConcurrentCloseIsSafe(t *testing.T) {
 	connection := &fakeConnection{}
 	stream := &fakeStream{}
 	client := &Client{
-		principal: authentication.Principal{UserID: "user"}, send: make(chan protocol.Message, 1),
+		principal: identity.Principal{UserID: "user"}, send: make(chan protocol.Message, 1),
 		connection: connection, stream: stream,
 	}
 	var wait sync.WaitGroup

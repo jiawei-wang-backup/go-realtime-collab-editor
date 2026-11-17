@@ -8,7 +8,7 @@ ARG GOPROXY=https://proxy.golang.org,direct
 COPY go.mod go.sum ./
 RUN GOPROXY=${GOPROXY} go mod download
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/collab-server ./cmd/server
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/collab-server ./cmd/service
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/healthcheck ./cmd/healthcheck
 
 FROM ${RUNTIME_IMAGE}

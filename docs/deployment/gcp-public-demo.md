@@ -1,6 +1,6 @@
 # GCP 单机公开 Demo 部署
 
-本文档描述一个临时、低成本的公开演示环境。它与 `deploy/gcp/` 中的多节点生产准备方案完全独立，不修改后者，也不创建 Cloud SQL、Memorystore、GKE、Cloud NAT 或 Load Balancer。
+本文档描述一个临时、低成本的公开演示环境。它与 `deployments/gcp/` 中的多节点生产准备方案完全独立，不修改后者，也不创建 Cloud SQL、Memorystore、GKE、Cloud NAT 或 Load Balancer。
 
 ## 架构
 
@@ -23,11 +23,11 @@ flowchart LR
 
 ## 文件
 
-- `deploy/demo/docker-compose.demo.yml`：单机应用栈。
-- `deploy/demo/Dockerfile.frontend`：构建 React 并由 Nginx 提供静态文件。
-- `deploy/demo/Dockerfile.runner`：只包含 Runner 和 Docker CLI。
-- `deploy/demo/nginx.conf`：同源 REST/WebSocket 反向代理。
-- `deploy/demo-gcp/`：独立单 VM Terraform，不使用或修改 `deploy/gcp/`。
+- `deployments/demo/docker-compose.demo.yml`：单机应用栈。
+- `deployments/demo/Dockerfile.frontend`：构建 React 并由 Nginx 提供静态文件。
+- `deployments/demo/Dockerfile.runner`：只包含 Runner 和 Docker CLI。
+- `deployments/demo/nginx.conf`：同源 REST/WebSocket 反向代理。
+- `deployments/demo-gcp/`：独立单 VM Terraform，不使用或修改 `deployments/gcp/`。
 - `scripts/deploy-demo.sh`：显式确认后创建 VM、上传当前工作区、启动 Compose 并验证。
 - `scripts/backup-demo.sh`：通过 IAP 将一致性 MySQL Dump 保存到本机并生成 SHA-256。
 - `scripts/restore-demo.sh`：校验备份并在显式确认后恢复。

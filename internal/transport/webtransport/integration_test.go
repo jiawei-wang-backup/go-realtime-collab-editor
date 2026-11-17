@@ -17,31 +17,32 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/authentication"
-	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/collab"
+	memory "github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/adapter/memory/documents"
+	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/app/authentication"
+	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/app/room"
+	identity "github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/domain/authentication"
+	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/domain/collab"
 	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/protocol"
-	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/room"
-	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/storage"
 	browsertransport "github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/transport/browser"
 	webtransportgo "github.com/quic-go/webtransport-go"
 )
 
 type integrationAuthenticator struct{}
 
-func (integrationAuthenticator) AuthenticateToken(context.Context, string) (authentication.Principal, error) {
-	return authentication.Principal{UserID: "owner", Username: "owner", SessionID: "session", Trusted: true}, nil
+func (integrationAuthenticator) AuthenticateToken(context.Context, string) (identity.Principal, error) {
+	return identity.Principal{UserID: "owner", Username: "owner", SessionID: "session", Trusted: true}, nil
 }
-func (integrationAuthenticator) AuthenticateHTTP(*http.Request) (authentication.Principal, error) {
-	return authentication.Principal{}, nil
+func (integrationAuthenticator) AuthenticateHTTP(*http.Request) (identity.Principal, error) {
+	return identity.Principal{}, nil
 }
-func (integrationAuthenticator) ValidatePrincipal(context.Context, authentication.Principal) error {
+func (integrationAuthenticator) ValidatePrincipal(context.Context, identity.Principal) error {
 	return nil
 }
 
 func TestRealWebTransportUsesSharedRoomProtocol(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	store := storage.NewMemory()
+	store := memory.NewMemory()
 	if _, err := store.CreateDocument(ctx, "doc", "abc", "owner"); err != nil {
 		t.Fatal(err)
 	}

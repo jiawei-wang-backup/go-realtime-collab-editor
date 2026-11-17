@@ -18,13 +18,17 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/authentication"
-	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/collab"
-	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/permission"
+	jwtauth "github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/adapter/jwt"
+	memoryauth "github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/adapter/memory/authentication"
+	memory "github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/adapter/memory/documents"
+	redisauth "github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/adapter/redis"
+	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/app/authentication"
+	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/app/room"
+	identity "github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/domain/authentication"
+	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/domain/collab"
+	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/domain/permission"
+	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/domain/storage"
 	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/protocol"
-	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/room"
-	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/storage"
-
 	"github.com/redis/go-redis/v9"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -182,17 +186,17 @@ func TestRealQUICCrossNodeRedisLogoutClosesRemoteConnection(t *testing.T) {
 	options := func() *redis.Options {
 		return &redis.Options{Addr: redisAddress, Password: os.Getenv("REDIS_TEST_PASSWORD"), DB: 12}
 	}
-	storeA, err := authentication.NewRedisSessions(context.Background(), options())
+	storeA, err := redisauth.NewRedisSessions(context.Background(), options())
 	if err != nil {
 		t.Fatal(err)
 	}
-	storeB, err := authentication.NewRedisSessions(context.Background(), options())
+	storeB, err := redisauth.NewRedisSessions(context.Background(), options())
 	if err != nil {
 		_ = storeA.Close()
 		t.Fatal(err)
 	}
-	users := authentication.NewMemoryUsers()
-	tokens, err := authentication.NewTokenManager(authentication.JWTConfig{
+	users := memoryauth.NewMemoryUsers()
+	tokens, err := jwtauth.NewTokenManager(jwtauth.JWTConfig{
 		Secret: []byte("0123456789abcdef0123456789abcdef"), Issuer: "phase86-quic", Audience: "phase86-quic", AccessTTL: time.Hour,
 	})
 	if err != nil {
@@ -227,7 +231,7 @@ func TestRealQUICCrossNodeRedisLogoutClosesRemoteConnection(t *testing.T) {
 	}
 
 	serverTLS, clientTLS := testTLSConfigs(t)
-	documentStore := storage.NewMemory()
+	documentStore := memory.NewMemory()
 	if _, err := documentStore.CreateDocument(context.Background(), "phase86-doc", "", user.ID); err != nil {
 		t.Fatal(err)
 	}
@@ -444,32 +448,32 @@ func TestRealQUICRejectsInvalidAuthAndInsecureTLSConfig(t *testing.T) {
 type quicFixture struct {
 	server    *Server
 	manager   *room.Manager
-	store     *storage.Memory
-	users     *authentication.MemoryUsers
-	sessions  *authentication.MemorySessions
+	store     *memory.Memory
+	users     *memoryauth.MemoryUsers
+	sessions  *memoryauth.MemorySessions
 	service   *authentication.Service
 	clientTLS *tls.Config
 }
 
 type testUser struct {
-	user      authentication.User
+	user      identity.User
 	token     string
-	principal authentication.Principal
+	principal identity.Principal
 }
 
 func newQUICFixture(t *testing.T, snapshotInterval int) *quicFixture {
 	t.Helper()
 	serverTLS, clientTLS := testTLSConfigs(t)
-	users := authentication.NewMemoryUsers()
-	sessions := authentication.NewMemorySessions()
-	tokens, err := authentication.NewTokenManager(authentication.JWTConfig{
+	users := memoryauth.NewMemoryUsers()
+	sessions := memoryauth.NewMemorySessions()
+	tokens, err := jwtauth.NewTokenManager(jwtauth.JWTConfig{
 		Secret: []byte("0123456789abcdef0123456789abcdef"), Issuer: "test", Audience: "test", AccessTTL: time.Hour,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	service := authentication.NewService(users, sessions, tokens, authentication.ServiceConfig{RefreshTTL: time.Hour, BcryptCost: bcrypt.MinCost})
-	store := storage.NewMemory()
+	store := memory.NewMemory()
 	manager := room.NewManager(store, room.WithSnapshotPolicy(snapshotInterval, 100, time.Second))
 	config := DefaultConfig()
 	config.Address = "127.0.0.1:0"

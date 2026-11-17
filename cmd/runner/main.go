@@ -14,7 +14,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/execution"
+	docker "github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/adapter/docker"
+	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/domain/execution"
+	runnerhttp "github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/transport/http/runner"
 )
 
 func main() {
@@ -31,11 +33,11 @@ func run() error {
 	if err := exec.Command("docker", "image", "inspect", limits.Image).Run(); err != nil {
 		return fmt.Errorf("fixed sandbox image %q is unavailable; pull it before starting the runner", limits.Image)
 	}
-	runner, err := execution.NewDockerRunner(limits)
+	runner, err := docker.NewDockerRunner(limits)
 	if err != nil {
 		return err
 	}
-	handler, err := execution.NewHandler(runner, token, limits)
+	handler, err := runnerhttp.NewHandler(runner, token, limits)
 	if err != nil {
 		return err
 	}

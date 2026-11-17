@@ -196,8 +196,8 @@ test.describe('distributed browser WebTransport', () => {
       await share.getByRole('button', { name: 'Done' }).click()
 
       await pageB.reload()
-      await expect(pageB.getByText(documentId, { exact: true })).toBeVisible()
-      await pageB.getByText(documentId, { exact: true }).click()
+      await expect(pageB.getByRole('button', { name: documentId, exact: true })).toBeVisible()
+      await pageB.getByRole('button', { name: documentId, exact: true }).click()
       await waitForConnected(pageB)
       await expect(pageB.locator('.editor-statusbar')).toContainText('webtransport')
       await expect(pageA.locator('.participant')).toHaveCount(2)

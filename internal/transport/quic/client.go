@@ -7,11 +7,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/authentication"
+	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/app/authentication"
+	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/app/room"
+	identity "github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/domain/authentication"
 	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/protocol"
-	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/room"
-	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/transport"
-
 	quic "github.com/quic-go/quic-go"
 )
 
@@ -23,7 +22,7 @@ type Client struct {
 	stream        clientStream
 	room          *room.Room
 	docID         string
-	principal     authentication.Principal
+	principal     identity.Principal
 	authenticator authentication.Authenticator
 	config        Config
 	send          chan protocol.Message
@@ -49,14 +48,14 @@ type clientStream interface {
 	SetWriteDeadline(time.Time) error
 }
 
-var _ transport.Client = (*Client)(nil)
+var _ room.Connection = (*Client)(nil)
 
 func newClient(
 	connection clientConnection,
 	stream clientStream,
 	targetRoom *room.Room,
 	docID string,
-	principal authentication.Principal,
+	principal identity.Principal,
 	authenticator authentication.Authenticator,
 	config Config,
 ) *Client {

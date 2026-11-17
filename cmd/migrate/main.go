@@ -4,9 +4,9 @@ import (
 	"context"
 	"log"
 
-	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/config"
+	mysqlstorage "github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/adapter/mysql"
 	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/migration"
-	mysqlstorage "github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/storage/mysql"
+	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/platform/config"
 )
 
 func main() {

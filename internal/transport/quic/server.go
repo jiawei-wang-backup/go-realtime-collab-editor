@@ -12,14 +12,14 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/authentication"
-	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/cluster"
+	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/app/authentication"
+	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/app/room"
+	identity "github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/domain/authentication"
+	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/domain/cluster"
+	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/domain/storage"
 	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/protocol"
-	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/room"
-	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/storage"
-	"go.opentelemetry.io/otel"
-
 	quic "github.com/quic-go/quic-go"
+	"go.opentelemetry.io/otel"
 )
 
 const ALPN = "collab-editor-v1"
@@ -303,13 +303,13 @@ func (s *Server) acceptCollaborationStream(connection *quic.Conn) (*quic.Stream,
 	return connection.AcceptStream(ctx)
 }
 
-func (s *Server) authenticateStream(connection *quic.Conn, stream *quic.Stream) (authentication.Principal, bool) {
+func (s *Server) authenticateStream(connection *quic.Conn, stream *quic.Stream) (identity.Principal, bool) {
 	_ = stream.SetReadDeadline(time.Now().Add(s.config.AuthTimeout))
 	authMessage, err := readMessage(stream, s.config.MaxMessageSize)
 	if err != nil || authMessage.Type != protocol.TypeAuth || authMessage.Token == "" {
 		s.writeHandshakeError(stream, protocol.CodeBadMessage, "AUTH with a bearer token is required")
 		_ = connection.CloseWithError(applicationCloseCode, "invalid authentication message")
-		return authentication.Principal{}, false
+		return identity.Principal{}, false
 	}
 	ctx, cancel := context.WithTimeout(connection.Context(), s.config.AuthTimeout)
 	principal, err := s.authenticator.AuthenticateToken(ctx, authMessage.Token)
@@ -317,12 +317,12 @@ func (s *Server) authenticateStream(connection *quic.Conn, stream *quic.Stream) 
 	if err != nil || !principal.Trusted {
 		s.writeHandshakeError(stream, protocol.CodePermissionDenied, "invalid or inactive session")
 		_ = connection.CloseWithError(applicationCloseCode, "authentication failed")
-		return authentication.Principal{}, false
+		return identity.Principal{}, false
 	}
 	_ = stream.SetWriteDeadline(time.Now().Add(s.config.WriteTimeout))
 	if err := writeMessage(stream, protocol.Message{Type: protocol.TypeAuthOK}, s.config.MaxMessageSize); err != nil {
 		_ = connection.CloseWithError(applicationCloseCode, "could not send authentication response")
-		return authentication.Principal{}, false
+		return identity.Principal{}, false
 	}
 	return principal, true
 }
@@ -384,11 +384,11 @@ func (s *Server) isLocalOwner(owner cluster.Owner) bool {
 	return owner.NodeID == s.config.LocalNode.NodeID && owner.Incarnation == s.config.LocalNode.Incarnation
 }
 
-func (s *Server) runClient(connection *quic.Conn, stream *quic.Stream, targetRoom *room.Room, initial protocol.Message, principal authentication.Principal) {
+func (s *Server) runClient(connection *quic.Conn, stream *quic.Stream, targetRoom *room.Room, initial protocol.Message, principal identity.Principal) {
 	client := newClient(connection, stream, targetRoom, initial.DocID, principal, s.authenticator, s.config)
 	if s.config.ConnectionRegistry != nil {
 		client.unregister = s.config.ConnectionRegistry.Register(principal.SessionID, client, func() {
-			client.Close(authentication.ErrSessionInvalid)
+			client.Close(identity.ErrSessionInvalid)
 		})
 	}
 	if !s.addClient(client) {

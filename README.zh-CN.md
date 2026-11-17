@@ -237,42 +237,24 @@ Go 代码执行与协作数据链路完全分离：`Execution API → Runner →
 ## 6. 项目结构
 
 ```text
-cmd/                    # 可执行程序
-  server/               # REST、Native QUIC、WebTransport 与生命周期组合根
-  quic-client/          # 可恢复 CLI 客户端
-  migrate/              # MySQL Migration runner
-  admin/                # 管理工具
-  loadtest/             # REST + QUIC 压测工具
-  healthcheck/          # 容器健康检查
-  runner/               # 隔离 Go 执行服务，唯一可调用 Docker 的组件
-internal/
-  api/                  # REST、认证中间件、跨节点 mTLS forwarding
-  authentication/       # JWT、Redis Session、Rotation、Presence、Revocation
-  client/               # Reconnect、Redirect、Resume、Pending recovery
-  cluster/              # Membership、Rendezvous、Ownership 接口
-    etcd/                # etcd Registry、Lease、Ownership、Failover
-    rpc/                 # 内部 mTLS RPC
-  collab/               # 文档 Operation 与 OT
-  execution/            # Runner 契约、Unix Socket Client/Server 和 Docker Sandbox
-  config/               # 环境配置与安全校验
-  migration/            # 有序、可恢复的 Migration runner
-  observability/        # 日志、Metrics、Tracing、Health
-  protocol/             # REST/QUIC 消息与错误码
-  room/                 # 单 goroutine 文档状态机
-  storage/              # Storage 接口、Memory 实现与 Replay
-    mysql/               # MySQL Transaction 与 Fencing 实现
-  transport/            # Transport 接口
-    browser/             # 共用的浏览器认证、路由、恢复与 Room 会话
-    quic/                # QUIC Framing、Client、Server、Connection 生命周期
-    webtransport/        # HTTP/3 WebTransport Listener 与可靠 Stream Framing
-  websocket/            # 复用浏览器共享会话的 WebSocket Adapter
-frontend/               # React + TypeScript + Vite + Monaco 浏览器客户端
-migrations/             # MySQL Schema Migration
-deploy/gcp/              # Google Cloud Terraform 与启动模板
-docs/                    # 架构、运维、测试和部署报告
+cmd/service/                                              # 服务入口与依赖组装
+cmd/{admin,healthcheck,loadtest,migrate,quic-client,runner}/ # 其他独立命令入口
+internal/app/                                             # Room 生命周期、认证和集群协调
+internal/domain/                                          # 文档、OT、权限和存储接口
+internal/adapter/                                         # MySQL、Redis、etcd、JWT、内存存储和 Runner 适配
+internal/platform/                                        # 配置、日志、监控和健康检查
+internal/transport/http/                                  # REST、跨节点权限 RPC 和 Runner HTTP 入口
+internal/transport/{browser,websocket,quic,webtransport}/ # 实时传输和浏览器协作会话
+internal/client/                                          # CLI 重连、恢复和本地持久化
+internal/protocol/                                        # 共享实时消息和错误码
+internal/migration/                                       # 数据库迁移工具
+frontend/                                                 # React 浏览器客户端
+migrations/                                               # MySQL 数据库迁移
+deployments/                                              # Docker Compose 和 Google Cloud Terraform
+docs/                                                     # 架构、测试、运维和部署文档
 ```
 
-`internal/room` 不引用 QUIC 实现，`internal/storage` 不依赖 etcd，集群协调、持久化和 Transport 分别通过明确的接口连接。`cmd/server` 是负责创建依赖并按顺序关闭资源的组合根。
+`internal/app/room` 不引用 QUIC 实现，`internal/domain/storage` 不依赖 etcd，集群协调、持久化和 Transport 分别通过明确的接口连接。`cmd/service` 是负责创建依赖并按顺序关闭资源的组合根。
 
 ## 7. 快速开始
 
@@ -321,7 +303,7 @@ go run ./cmd/migrate
 单节点开发模式仍使用完整的 MySQL、Redis、JWT 和 Native QUIC 路径。REST 默认监听 TCP `:8080`，Native QUIC 默认监听 UDP `:8443`，管理端点默认只监听 `127.0.0.1:9090`。WebTransport 为显式启用项，可以在 UDP 上复用数字端口 `8080`；它要求浏览器信任的 TLS 证书，以及精确匹配的 `CORS_ALLOWED_ORIGINS`。
 
 ```bash
-go run ./cmd/server
+go run ./cmd/service
 ```
 
 ### 启动浏览器客户端
@@ -345,7 +327,7 @@ docker pull golang:1.26.10-bookworm
 export RUNNER_SOCKET=/tmp/collab-editor-runner.sock
 export RUNNER_TOKEN="$(openssl rand -hex 32)"
 go build -o /tmp/collab-runner ./cmd/runner
-go build -o /tmp/collab-server ./cmd/server
+go build -o /tmp/collab-server ./cmd/service
 /tmp/collab-runner &
 runner_pid=$!
 /tmp/collab-server
@@ -407,7 +389,7 @@ go build ./...
 - 单元测试覆盖 OT、Room 顺序、权限、协议、Framing、客户端状态机、配置和错误映射。
 - 集成测试使用真实 MySQL、Redis、etcd、TLS/mTLS、QUIC 和 SQLite，覆盖事务回滚、Fencing、Ownership 接管、跨节点 Logout、Snapshot + Replay、断线恢复和进程崩溃恢复。
 - 浏览器 E2E 使用真实 Go/MySQL/Redis 环境，覆盖双用户 OT、IndexedDB Pending 恢复、光标与选区、Owner Redirect、Fencing 故障接管和 Session 撤销。跨引擎测试覆盖 Chromium 141、Firefox 142 和 WebKit 26 的四种组合。
-- Go 执行测试使用固定的真实 Docker 镜像，验证编译、panic、超时、网络与宿主机路径隔离、Memory/CPU/PID 参数、输出截断、容器清理、并发隔离、浏览器输出和 Viewer 拒绝。使用 `RUN_DOCKER_INTEGRATION=true go test -count=1 -run TestDockerRunnerRealSandbox -v ./internal/execution` 显式运行；Skip 不能计为 Docker Sandbox PASS。
+- Go 执行测试使用固定的真实 Docker 镜像，验证编译、panic、超时、网络与宿主机路径隔离、Memory/CPU/PID 参数、输出截断、容器清理、并发隔离、浏览器输出和 Viewer 拒绝。使用 `RUN_DOCKER_INTEGRATION=true go test -count=1 -run TestDockerRunnerRealSandbox -v ./internal/adapter/docker` 显式运行；Skip 不能计为 Docker Sandbox PASS。
 - Race Detector 在 Package 并行执行条件下验证 Room、QUIC、Client、Session 与 Ownership 并发路径。
 - 未设置集成测试环境变量时，相关测试会明确 Skip；这种结果不能视为真实基础设施验证通过。变量包括 `MYSQL_TEST_DSN`、`REDIS_TEST_ADDR`、`REDIS_TEST_PASSWORD`、`ETCD_TEST_ENDPOINTS`、etcd TLS 文件，以及 `CLUSTER_TEST_*` 内部 mTLS 证书。
 - 完整隔离环境和无 Skip 的验收结果记录在 [最终质量 Gate](docs/operations/final-quality-gate.md) 与 [Phase 9.1 提交前审计](docs/operations/phase-9.1-pre-commit-audit.md)。
@@ -425,10 +407,10 @@ go build ./...
 ```bash
 docker build -t collab-editor:local .
 
-terraform -chdir=deploy/gcp fmt -recursive -check
-terraform -chdir=deploy/gcp init
-terraform -chdir=deploy/gcp validate
-terraform -chdir=deploy/gcp plan -refresh=false
+terraform -chdir=deployments/gcp fmt -recursive -check
+terraform -chdir=deployments/gcp init
+terraform -chdir=deployments/gcp validate
+terraform -chdir=deployments/gcp plan -refresh=false
 ```
 
 不要在未审核 Plan、预算和回滚方案时执行 Apply。

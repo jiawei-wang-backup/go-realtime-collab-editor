@@ -237,42 +237,24 @@ Versions below are read from the current repository configuration.
 ## 6. Project Structure
 
 ```text
-cmd/                    # Executables
-  server/               # REST, native QUIC, WebTransport, and lifecycle composition root
-  quic-client/          # Recoverable CLI client
-  migrate/              # MySQL migration runner
-  admin/                # Administrative utility
-  loadtest/             # REST + QUIC load generator
-  healthcheck/          # Container health probe
-  runner/               # Isolated Go execution service; the only Docker owner
-internal/
-  api/                  # REST, authentication middleware, cross-node mTLS forwarding
-  authentication/       # JWT, Redis sessions, rotation, presence, and revocation
-  client/               # Reconnect, redirect, resume, and pending recovery
-  cluster/              # Membership, Rendezvous, and ownership interfaces
-    etcd/                # etcd registry, leases, ownership, and failover
-    rpc/                 # Internal mTLS RPC
-  collab/               # Document operations and OT
-  execution/            # Runner contract, Unix-socket client/server, Docker sandbox
-  config/               # Environment configuration and security validation
-  migration/            # Ordered, recoverable migration runner
-  observability/        # Logs, metrics, tracing, and health
-  protocol/             # REST/QUIC messages and error codes
-  room/                 # Single-goroutine document state machine
-  storage/              # Storage contracts, memory implementation, and replay
-    mysql/               # MySQL transactions and fencing implementation
-  transport/            # Transport interface
-    browser/             # Shared browser authentication, routing, recovery, and Room session
-    quic/                # QUIC framing, client, server, and connection lifecycle
-    webtransport/        # HTTP/3 WebTransport listener and reliable stream framing
-  websocket/            # WebSocket adapter over the shared browser session
-frontend/               # React + TypeScript + Vite + Monaco browser client
-migrations/             # MySQL schema migrations
-deploy/gcp/              # Google Cloud Terraform and startup templates
-docs/                    # Architecture, operations, testing, and deployment reports
+cmd/service/                                              # Server entry point and dependency wiring
+cmd/{admin,healthcheck,loadtest,migrate,quic-client,runner}/ # Other executable entry points
+internal/app/                                             # Room lifecycle, authentication, and cluster coordination
+internal/domain/                                          # Document, OT, permission, and storage contracts
+internal/adapter/                                         # MySQL, Redis, etcd, JWT, in-memory storage, and Runner adapters
+internal/platform/                                        # Configuration, logging, metrics, and health
+internal/transport/http/                                  # REST, internal permission RPC, and Runner HTTP handlers
+internal/transport/{browser,websocket,quic,webtransport}/ # Realtime transports and browser sessions
+internal/client/                                          # CLI reconnect, resume, and local persistence
+internal/protocol/                                        # Shared realtime messages and error codes
+internal/migration/                                       # Database migration runner
+frontend/                                                 # React browser client
+migrations/                                               # MySQL schema migrations
+deployments/                                              # Docker Compose and Google Cloud Terraform
+docs/                                                     # Architecture, testing, operations, and deployment notes
 ```
 
-`internal/room` does not import the QUIC implementation, and `internal/storage` does not depend on etcd. Cluster coordination, persistence, and transport meet through explicit interfaces. `cmd/server` is the composition root that creates dependencies and shuts them down in order.
+`internal/app/room` does not import the QUIC implementation, and `internal/domain/storage` does not depend on etcd. Cluster coordination, persistence, and transport meet through explicit interfaces. `cmd/service` is the composition root that creates dependencies and shuts them down in order.
 
 ## 7. Getting Started
 
@@ -321,7 +303,7 @@ Use MySQL to try folder management and version history. For an existing database
 Single-node development mode still exercises MySQL, Redis, JWT, and native QUIC. REST listens on TCP `:8080`, native QUIC on UDP `:8443`, and management endpoints on `127.0.0.1:9090` by default. WebTransport is opt-in and can share numeric port `8080` over UDP; it requires a browser-trusted TLS certificate and an exact `CORS_ALLOWED_ORIGINS` entry.
 
 ```bash
-go run ./cmd/server
+go run ./cmd/service
 ```
 
 ### Start the Browser Client
@@ -345,7 +327,7 @@ docker pull golang:1.26.10-bookworm
 export RUNNER_SOCKET=/tmp/collab-editor-runner.sock
 export RUNNER_TOKEN="$(openssl rand -hex 32)"
 go build -o /tmp/collab-runner ./cmd/runner
-go build -o /tmp/collab-server ./cmd/server
+go build -o /tmp/collab-server ./cmd/service
 /tmp/collab-runner &
 runner_pid=$!
 /tmp/collab-server
@@ -407,7 +389,7 @@ go build ./...
 - Unit tests cover OT, Room ordering, permissions, protocol handling, framing, the client state machine, configuration, and error mapping.
 - Integration tests use real MySQL, Redis, etcd, TLS/mTLS, QUIC, and SQLite to verify rollback, fencing, ownership takeover, cross-node logout, Snapshot + Replay, reconnect, and process-crash recovery.
 - Browser E2E tests use real Go/MySQL/Redis environments to verify two-user OT, IndexedDB pending recovery, cursor/selection presence, Owner Redirect, fencing failover, and session revocation. Cross-engine runs cover Chromium 141, Firefox 142, and WebKit 26 in four pairings.
-- Go execution tests use the pinned real Docker image to verify compilation, panic handling, timeouts, network and host-path isolation, memory/CPU/PID arguments, output truncation, cleanup, concurrent isolation, browser output, and Viewer rejection. Run them explicitly with `RUN_DOCKER_INTEGRATION=true go test -count=1 -run TestDockerRunnerRealSandbox -v ./internal/execution`; a skipped result is not a Docker sandbox pass.
+- Go execution tests use the pinned real Docker image to verify compilation, panic handling, timeouts, network and host-path isolation, memory/CPU/PID arguments, output truncation, cleanup, concurrent isolation, browser output, and Viewer rejection. Run them explicitly with `RUN_DOCKER_INTEGRATION=true go test -count=1 -run TestDockerRunnerRealSandbox -v ./internal/adapter/docker`; a skipped result is not a Docker sandbox pass.
 - The Race Detector exercises concurrent Room, QUIC, Client, Session, and Ownership paths with package-level parallelism enabled.
 - Integration tests explicitly skip when their environment variables are absent; a skipped result is not treated as real-infrastructure validation. Required values include `MYSQL_TEST_DSN`, `REDIS_TEST_ADDR`, `REDIS_TEST_PASSWORD`, `ETCD_TEST_ENDPOINTS`, etcd TLS files, and the `CLUSTER_TEST_*` internal mTLS certificates.
 - The isolated, no-skip validation procedure and results are documented in [Final Quality Gate](docs/operations/final-quality-gate.md) and [Phase 9.1 Audit](docs/operations/phase-9.1-pre-commit-audit.md).
@@ -425,10 +407,10 @@ The repository includes a multi-stage Dockerfile, a non-root runtime user, healt
 ```bash
 docker build -t collab-editor:local .
 
-terraform -chdir=deploy/gcp fmt -recursive -check
-terraform -chdir=deploy/gcp init
-terraform -chdir=deploy/gcp validate
-terraform -chdir=deploy/gcp plan -refresh=false
+terraform -chdir=deployments/gcp fmt -recursive -check
+terraform -chdir=deployments/gcp init
+terraform -chdir=deployments/gcp validate
+terraform -chdir=deployments/gcp plan -refresh=false
 ```
 
 Do not apply without an approved plan, budget, and rollback procedure.

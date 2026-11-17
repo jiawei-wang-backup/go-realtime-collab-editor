@@ -7,10 +7,10 @@ import (
 	"log"
 	"os"
 
-	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/authentication"
-	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/config"
+	mysqlstorage "github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/adapter/mysql"
+	identity "github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/domain/authentication"
 	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/migration"
-	mysqlstorage "github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/storage/mysql"
+	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/platform/config"
 	"golang.org/x/crypto/bcrypt"
 	"golang.org/x/term"
 )
@@ -23,7 +23,7 @@ func main() {
 	id := flags.String("id", "", "existing demo user ID")
 	username := flags.String("username", "", "username")
 	_ = flags.Parse(os.Args[2:])
-	if *id == "" || authentication.ValidateUsername(*username) != nil {
+	if *id == "" || identity.ValidateUsername(*username) != nil {
 		log.Fatal("valid --id and --username are required")
 	}
 	fmt.Fprint(os.Stderr, "Password: ")
@@ -41,7 +41,7 @@ func main() {
 	if string(password) != string(confirmation) {
 		log.Fatal("passwords do not match")
 	}
-	if err := authentication.ValidatePassword(string(password)); err != nil {
+	if err := identity.ValidatePassword(string(password)); err != nil {
 		log.Fatal(err)
 	}
 	hash, err := bcrypt.GenerateFromPassword(password, bcrypt.DefaultCost)
@@ -69,8 +69,8 @@ func main() {
 	if err := migration.Run(context.Background(), store.DB(), "migrations"); err != nil {
 		log.Fatal(err)
 	}
-	repo := authentication.NewMySQLUsers(store.DB())
-	if err := repo.CreateUser(context.Background(), authentication.User{ID: *id, Username: *username, PasswordHash: string(hash), Status: authentication.UserActive}); err != nil {
+	repo := mysqlstorage.NewMySQLUsers(store.DB())
+	if err := repo.CreateUser(context.Background(), identity.User{ID: *id, Username: *username, PasswordHash: string(hash), Status: identity.UserActive}); err != nil {
 		log.Fatal(err)
 	}
 	log.Printf("created user %s without changing existing document ownership or permissions", *id)
