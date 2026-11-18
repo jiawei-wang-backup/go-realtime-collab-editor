@@ -815,15 +815,20 @@ func (r *Room) retrySnapshotAfter(delay time.Duration) {
 }
 
 func (r *Room) versionedOperationsAfter(version uint64) []protocol.VersionedOperation {
-	operations := make([]protocol.VersionedOperation, 0, len(r.history))
-	for _, applied := range r.history {
-		if applied.Version > version {
-			operation := applied.Operation
-			operation.ID = ""
-			operation.UserID = ""
-			operation.BaseVersion = 0
-			operations = append(operations, protocol.VersionedOperation{Version: applied.Version, RequestID: applied.ID, Operation: operation})
-		}
+	if len(r.history) == 0 || version >= r.history[len(r.history)-1].Version {
+		return []protocol.VersionedOperation{}
+	}
+	first := sort.Search(len(r.history), func(i int) bool {
+		return r.history[i].Version > version
+	})
+	missing := r.history[first:]
+	operations := make([]protocol.VersionedOperation, len(missing))
+	for i, applied := range missing {
+		operation := applied.Operation
+		operation.ID = ""
+		operation.UserID = ""
+		operation.BaseVersion = 0
+		operations[i] = protocol.VersionedOperation{Version: applied.Version, RequestID: applied.ID, Operation: operation}
 	}
 	return operations
 }

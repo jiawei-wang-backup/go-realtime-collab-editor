@@ -295,3 +295,25 @@ func waitSnapshot(t *testing.T, store storage.Store, docID string, version uint6
 	}
 	t.Fatalf("snapshot version %d was not saved", version)
 }
+
+func TestResumeAllocatesOnlyMissingHistory(t *testing.T) {
+	r := Room{historyFloor: 20, document: collab.Document{Version: 25}}
+	for v := uint64(21); v <= 25; v++ {
+		r.history = append(r.history, collab.AppliedOperation{Version: v, Operation: collab.Operation{
+			ID: fmt.Sprint(v), UserID: "owner", BaseVersion: v - 1, Kind: collab.OperationInsert, Text: "字",
+		}})
+	}
+	for _, from := range []uint64{20, 23, 24, 25} {
+		ops := r.resumeMessage(from).Operations
+		want := int(r.document.Version - from)
+		if len(ops) != want || cap(ops) != want {
+			t.Fatalf("from %d: len=%d cap=%d, want %d", from, len(ops), cap(ops), want)
+		}
+		for i, op := range ops {
+			v := from + uint64(i) + 1
+			if op.Version != v || op.RequestID != fmt.Sprint(v) || op.Operation != (collab.Operation{Kind: collab.OperationInsert, Text: "字"}) {
+				t.Fatalf("from %d: unexpected operation %#v at version %d", from, op, v)
+			}
+		}
+	}
+}
