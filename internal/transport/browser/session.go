@@ -50,7 +50,11 @@ func (config Config) Validate() error {
 }
 
 func Serve(parent context.Context, connection MessageConn, config Config) {
-	client := &sessionClient{connection: connection, config: config, send: make(chan protocol.Message, config.SendQueueSize), writeDone: make(chan struct{})}
+	client := &sessionClient{
+		connection: connection, config: config,
+		send:        make(chan protocol.Message, config.SendQueueSize),
+		cursorReady: make(chan struct{}, 1), writeDone: make(chan struct{}),
+	}
 	client.run(parent)
 }
 
@@ -63,7 +67,10 @@ type sessionClient struct {
 	send           chan protocol.Message
 	writeDone      chan struct{}
 	unregister     func()
-	mu             sync.RWMutex
+	mu             sync.Mutex
+	cursorReady    chan struct{}
+	cursorOrder    []string
+	pendingCursors map[string]pendingCursor
 	closed         bool
 	joined         bool
 	cursorWindow   time.Time
@@ -78,16 +85,45 @@ func (client *sessionClient) SupportsCursor() bool   { return true }
 func (client *sessionClient) DisplayName() string    { return client.principal.Username }
 
 func (client *sessionClient) TrySend(message protocol.Message) bool {
-	client.mu.RLock()
-	defer client.mu.RUnlock()
+	client.mu.Lock()
+	defer client.mu.Unlock()
 	if client.closed {
 		return false
+	}
+	if message.Cursor != nil && (message.Type == protocol.TypeCursorChanged || message.Type == protocol.TypeCursorRemoved) {
+		client.queueCursor(message)
+		return true
 	}
 	select {
 	case client.send <- message:
 		return true
 	default:
 		return false
+	}
+}
+
+type pendingCursor struct {
+	kind  string
+	docID string
+	state *protocol.CursorState
+}
+
+// 同一用户只保留最后一个光标状态（包括离开），不同用户按首次待发送顺序处理。
+// Room 在广播后不会修改该光标快照，所有接收方可以共享它。
+func (client *sessionClient) queueCursor(message protocol.Message) {
+	if client.pendingCursors == nil {
+		client.pendingCursors = make(map[string]pendingCursor)
+	}
+	userID := message.Cursor.UserID
+	if _, pending := client.pendingCursors[userID]; !pending {
+		client.cursorOrder = append(client.cursorOrder, userID)
+	}
+	client.pendingCursors[userID] = pendingCursor{kind: message.Type, docID: message.DocID, state: message.Cursor}
+	if len(client.cursorOrder) == 1 {
+		select {
+		case client.cursorReady <- struct{}{}:
+		default:
+		}
 	}
 }
 
@@ -287,23 +323,59 @@ func (client *sessionClient) allowCursorMessage() bool {
 	return client.cursorMessages <= cursorMessagesPerSecond
 }
 
+// 唯一的写协程先取可靠消息，再取光标。取消息时与入队共用锁，
+// 避免某个新版本的光标抢在对应的 edit_applied 前面发出。
+func (client *sessionClient) nextMessage(ctx context.Context) (protocol.Message, bool) {
+	for ctx.Err() == nil {
+		client.mu.Lock()
+		select {
+		case message, ok := <-client.send:
+			client.mu.Unlock()
+			return message, ok
+		default:
+		}
+		if len(client.cursorOrder) > 0 {
+			userID := client.cursorOrder[0]
+			client.cursorOrder[0] = ""
+			client.cursorOrder = client.cursorOrder[1:]
+			cursor := client.pendingCursors[userID]
+			delete(client.pendingCursors, userID)
+			client.mu.Unlock()
+			return protocol.Message{Type: cursor.kind, DocID: cursor.docID, Cursor: cursor.state}, true
+		}
+		client.mu.Unlock()
+		select {
+		case message, ok := <-client.send:
+			return message, ok
+		case <-client.cursorReady:
+		case <-ctx.Done():
+			return protocol.Message{}, false
+		}
+	}
+	return protocol.Message{}, false
+}
+
 func (client *sessionClient) writeLoop(ctx context.Context) {
 	defer close(client.writeDone)
+	var editVersion uint64
 	for {
-		select {
-		case <-ctx.Done():
+		message, ok := client.nextMessage(ctx)
+		if !ok {
 			return
-		case message, ok := <-client.send:
-			if !ok {
-				return
-			}
-			writeCtx, cancel := context.WithTimeout(ctx, client.config.WriteTimeout)
-			err := client.connection.Write(writeCtx, message)
-			cancel()
-			if err != nil {
-				client.Close(err)
-				return
-			}
+		}
+		// 编辑可能越过尚未发出的旧坐标。Room 会随后发布该用户的新坐标或离开通知。
+		if message.Type == protocol.TypeCursorChanged && message.Cursor != nil && message.Cursor.Version < editVersion {
+			continue
+		}
+		if message.Type == protocol.TypeEditApplied && message.Version > editVersion {
+			editVersion = message.Version
+		}
+		writeCtx, cancel := context.WithTimeout(ctx, client.config.WriteTimeout)
+		err := client.connection.Write(writeCtx, message)
+		cancel()
+		if err != nil {
+			client.Close(err)
+			return
 		}
 	}
 }
