@@ -359,8 +359,16 @@ func (s *Server) selectDocument(connection *quic.Conn, stream *quic.Stream) (pro
 			return protocol.Message{}, nil, false
 		}
 	}
-	targetRoom, err := s.manager.Room(initial.DocID)
+	ctx, cancel := context.WithTimeout(connection.Context(), s.config.OperationTimeout)
+	defer cancel()
+	targetRoom, err := s.manager.RoomContext(ctx, initial.DocID)
 	if err != nil {
+		var coded *room.CodedError
+		if errors.As(err, &coded) {
+			s.writeHandshakeError(stream, coded.Code, coded.Message)
+			_ = stream.Close()
+			return protocol.Message{}, nil, false
+		}
 		if errors.Is(err, storage.ErrNotFound) {
 			s.writeHandshakeError(stream, protocol.CodeBadMessage, "document not found")
 		} else {

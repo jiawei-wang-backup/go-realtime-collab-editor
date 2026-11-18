@@ -481,7 +481,7 @@ func (ownership *Ownership) observeAttempt(result string) {
 
 func (ownership *Ownership) cleanupFailedAcquire(ctx context.Context, key string, owner cluster.Owner, cause error) error {
 	payload, _ := json.Marshal(owner)
-	requestCtx, cancel := ownership.registry.client.requestContext(ctx)
+	requestCtx, cancel := ownership.registry.client.requestContext(context.WithoutCancel(ctx))
 	defer cancel()
 	_, _ = ownership.registry.client.client.Txn(requestCtx).
 		If(clientv3.Compare(clientv3.Value(key), "=", string(payload))).

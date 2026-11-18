@@ -22,13 +22,18 @@ import (
 )
 
 type Config struct {
-	Store                 storage.Store
-	Authenticator         authentication.Authenticator
-	RoomIdleTimeout       time.Duration
-	AuthService           *authentication.Service
-	SnapshotInterval      int
-	MaxHistoryOperations  int
-	SnapshotTimeout       time.Duration
+	Store                storage.Store
+	Authenticator        authentication.Authenticator
+	RoomIdleTimeout      time.Duration
+	AuthService          *authentication.Service
+	SnapshotInterval     int
+	MaxHistoryOperations int
+	SnapshotTimeout      time.Duration
+
+	RoomRecoveryConcurrency int
+	RoomRecoveryQueueSize   int
+	RoomRecoveryTimeout     time.Duration
+
 	Ownership             cluster.OwnershipCoordinator
 	OwnerResolver         cluster.OwnerResolver
 	LocalNode             cluster.Node
@@ -86,6 +91,7 @@ func NewServerWithConfig(config Config) *Server {
 	options := []room.ManagerOption{
 		room.WithIdleTimeout(config.RoomIdleTimeout),
 		room.WithSnapshotPolicy(config.SnapshotInterval, config.MaxHistoryOperations, config.SnapshotTimeout),
+		room.WithRecoveryAdmission(config.RoomRecoveryConcurrency, config.RoomRecoveryQueueSize, config.RoomRecoveryTimeout),
 	}
 	if config.Ownership != nil {
 		options = append(options, room.WithOwnership(config.Ownership))
@@ -308,7 +314,7 @@ func (s *Server) deleteDocument(writer http.ResponseWriter, request *http.Reques
 }
 
 func (s *Server) deleteLocalDocument(ctx context.Context, actorID, docID string) error {
-	targetRoom, err := s.manager.Room(docID)
+	targetRoom, err := s.manager.RoomContext(ctx, docID)
 	if err != nil {
 		return err
 	}
@@ -447,7 +453,7 @@ func (s *Server) writeDocument(w http.ResponseWriter, r *http.Request, document 
 }
 
 func (s *Server) readLocalDocument(ctx context.Context, userID, documentID string) (collab.Document, error) {
-	targetRoom, err := s.manager.Room(documentID)
+	targetRoom, err := s.manager.RoomContext(ctx, documentID)
 	if err != nil {
 		return collab.Document{}, err
 	}
@@ -498,7 +504,7 @@ func (s *Server) getPermission(writer http.ResponseWriter, request *http.Request
 }
 
 func (s *Server) readLocalPermission(ctx context.Context, actorID, documentID, userID string) (permission.Role, error) {
-	targetRoom, err := s.manager.Room(documentID)
+	targetRoom, err := s.manager.RoomContext(ctx, documentID)
 	if err != nil {
 		return "", err
 	}
@@ -568,7 +574,7 @@ func (s *Server) updatePermission(writer http.ResponseWriter, request *http.Requ
 }
 
 func (s *Server) changeLocalPermission(ctx context.Context, actorID, docID, userID string, role permission.Role) error {
-	targetRoom, err := s.manager.Room(docID)
+	targetRoom, err := s.manager.RoomContext(ctx, docID)
 	if err != nil {
 		return err
 	}

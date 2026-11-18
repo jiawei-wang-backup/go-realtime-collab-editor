@@ -109,6 +109,8 @@ type Manager struct {
 	ownership        cluster.OwnershipCoordinator
 	observer         Observer
 	failover         sync.WaitGroup
+	recovery         recoveryAdmission
+	recoveryWorkers  sync.WaitGroup
 }
 
 type Stats struct {
@@ -142,6 +144,7 @@ func NewManager(store storage.Store, options ...ManagerOption) *Manager {
 		maxHistory:       defaultMaxHistory,
 		snapshotTimeout:  defaultSnapshotTimeout,
 		authority:        storage.LocalAuthority,
+		recovery:         recoveryAdmission{timeout: defaultRecoveryTimeout},
 	}
 	for _, option := range options {
 		option(manager)
@@ -175,14 +178,25 @@ func (manager *Manager) runFailover(candidates <-chan string) {
 }
 
 func (manager *Manager) Room(documentID string) (*Room, error) {
+	return manager.RoomContext(context.Background(), documentID)
+}
+
+// RoomContext bounds the caller's wait. Recovery itself belongs to the manager,
+// so canceling one request does not interrupt other callers for that document.
+func (manager *Manager) RoomContext(ctx context.Context, documentID string) (*Room, error) {
 	for {
-		entry, open := manager.entry(documentID)
-		if open {
-			manager.open(documentID, entry)
+		if manager.ctx.Err() != nil {
+			return nil, ErrManagerClosed
+		}
+		if ctx.Err() != nil {
+			return nil, recoveryUnavailable("room wait canceled or timed out")
+		}
+		entry, err := manager.entry(documentID)
+		if err != nil {
+			return nil, err
 		}
 		manager.mu.Lock()
-		state := entry.state
-		target := entry.room
+		state, target := entry.state, entry.room
 		manager.mu.Unlock()
 		switch state {
 		case roomOpening:
@@ -194,6 +208,8 @@ func (manager *Manager) Room(documentID string) (*Room, error) {
 				if openErr != nil {
 					return nil, openErr
 				}
+			case <-ctx.Done():
+				return nil, recoveryUnavailable("room wait canceled or timed out")
 			case <-manager.ctx.Done():
 				return nil, ErrManagerClosed
 			}
@@ -201,9 +217,13 @@ func (manager *Manager) Room(documentID string) (*Room, error) {
 			if target != nil && !target.Stopped() {
 				return target, nil
 			}
+			// A stopped Room still needs to release its ownership before replacement.
+			fallthrough
 		case roomStopping:
 			select {
 			case <-entry.stopped:
+			case <-ctx.Done():
+				return nil, recoveryUnavailable("room wait canceled or timed out")
 			case <-manager.ctx.Done():
 				return nil, ErrManagerClosed
 			}
@@ -211,28 +231,13 @@ func (manager *Manager) Room(documentID string) (*Room, error) {
 	}
 }
 
-// entry decides local state only while holding the short manager critical
-// section. All etcd and storage I/O happens after the lock is released.
-func (manager *Manager) entry(documentID string) (*roomEntry, bool) {
-	manager.mu.Lock()
-	defer manager.mu.Unlock()
-	if manager.ctx.Err() != nil {
-		entry := &roomEntry{state: roomOpening, ready: make(chan struct{}), stopped: make(chan struct{}), openErr: ErrManagerClosed}
-		close(entry.ready)
-		return entry, false
-	}
-	if existing := manager.rooms[documentID]; existing != nil {
-		return existing, false
-	}
-	entry := &roomEntry{state: roomOpening, ready: make(chan struct{}), stopped: make(chan struct{})}
-	manager.rooms[documentID] = entry
-	return entry, true
-}
-
-func (manager *Manager) open(documentID string, entry *roomEntry) {
-	target, handle, err := manager.buildRoom(documentID, entry)
+func (manager *Manager) open(ctx context.Context, documentID string, entry *roomEntry) {
+	target, handle, err := manager.buildRoom(ctx, documentID, entry)
 	if err == nil && manager.ownership != nil {
-		err = manager.ownership.Activate(manager.ctx, handle)
+		err = manager.ownership.Activate(ctx, handle)
+	}
+	if err == nil {
+		err = ctx.Err()
 	}
 	if err == nil && target.Stopped() {
 		err = cluster.ErrOwnershipLost
@@ -244,7 +249,7 @@ func (manager *Manager) open(documentID string, entry *roomEntry) {
 		} else if handle != nil {
 			manager.release(handle)
 		}
-		manager.failOpen(documentID, entry, err)
+		manager.failOpen(documentID, entry, manager.recoveryError(ctx, err))
 		return
 	}
 
@@ -263,8 +268,8 @@ func (manager *Manager) open(documentID string, entry *roomEntry) {
 	manager.failOpen(documentID, entry, ErrManagerClosed)
 }
 
-func (manager *Manager) buildRoom(documentID string, entry *roomEntry) (*Room, *cluster.OwnershipHandle, error) {
-	traceCtx, span := otel.Tracer("collab-editor/room").Start(manager.ctx, "room.recovery")
+func (manager *Manager) buildRoom(ctx context.Context, documentID string, entry *roomEntry) (*Room, *cluster.OwnershipHandle, error) {
+	traceCtx, span := otel.Tracer("collab-editor/room").Start(ctx, "room.recovery")
 	defer span.End()
 	recoveryStarted := time.Now()
 	recoverySucceeded := false
@@ -274,38 +279,49 @@ func (manager *Manager) buildRoom(documentID string, entry *roomEntry) (*Room, *
 		}
 	}()
 	slog.Info("room recovery started", "component", "room_manager", "event", "recovery_started", "doc_id", documentID)
-	parent := traceCtx
+	parent := manager.ctx
+	recoveryCtx := traceCtx
 	authority := manager.authority
 	var handle *cluster.OwnershipHandle
 	var err error
 	if manager.ownership != nil {
-		handle, err = manager.ownership.Acquire(manager.ctx, documentID)
+		handle, err = manager.ownership.Acquire(traceCtx, documentID)
 		if err != nil {
 			return nil, nil, err
 		}
 		parent = handle.Context
 		authority = handle.Authority()
+		// The Room follows the ownership lease, while its initial database work
+		// must stop on either a lost lease or the recovery deadline.
+		ownedRecoveryCtx, cancel := context.WithCancel(traceCtx)
+		stop := context.AfterFunc(handle.Context, cancel)
+		defer stop()
+		defer cancel()
+		if handle.Context.Err() != nil {
+			cancel()
+		}
+		recoveryCtx = ownedRecoveryCtx
 	}
-	if err := manager.prepareWriteAuthority(documentID, authority); err != nil {
+	if err := manager.prepareWriteAuthority(recoveryCtx, documentID, authority); err != nil {
 		if handle != nil {
 			manager.release(handle)
 		}
 		return nil, nil, err
 	}
 	if handle != nil {
-		if err := manager.ownership.BeginRecovery(manager.ctx, handle); err != nil {
+		if err := manager.ownership.BeginRecovery(recoveryCtx, handle); err != nil {
 			manager.release(handle)
 			return nil, nil, err
 		}
 	}
-	state, err := manager.storage.LoadRecoveryState(parent, documentID, authority)
+	state, err := manager.storage.LoadRecoveryState(recoveryCtx, documentID, authority)
 	if err != nil {
 		if handle != nil {
 			manager.release(handle)
 		}
 		return nil, nil, err
 	}
-	if err := storage.ValidateRecoveryState(state); err != nil {
+	if err := storage.ValidateRecoveryStateContext(recoveryCtx, state); err != nil {
 		if handle != nil {
 			manager.release(handle)
 		}
@@ -344,11 +360,11 @@ func (manager *Manager) buildRoom(documentID string, entry *roomEntry) (*Room, *
 	return target, handle, nil
 }
 
-func (manager *Manager) prepareWriteAuthority(documentID string, authority storage.WriteAuthority) error {
+func (manager *Manager) prepareWriteAuthority(ctx context.Context, documentID string, authority storage.WriteAuthority) error {
 	if err := storage.ValidateWriteAuthority(authority); err != nil {
 		return err
 	}
-	current, err := manager.storage.GetWriteAuthority(manager.ctx, documentID)
+	current, err := manager.storage.GetWriteAuthority(ctx, documentID)
 	if err != nil {
 		return err
 	}
@@ -358,7 +374,7 @@ func (manager *Manager) prepareWriteAuthority(documentID string, authority stora
 	if authority.FencingToken <= current.FencingToken {
 		return storage.ErrOwnershipConflict
 	}
-	return manager.storage.ActivateOwnership(manager.ctx, documentID, authority)
+	return manager.storage.ActivateOwnership(ctx, documentID, authority)
 }
 
 func (manager *Manager) failOpen(documentID string, entry *roomEntry, err error) {
@@ -435,6 +451,7 @@ func (manager *Manager) Shutdown(ctx context.Context) error {
 		}
 	}
 	manager.failover.Wait()
+	manager.recoveryWorkers.Wait()
 	return nil
 }
 

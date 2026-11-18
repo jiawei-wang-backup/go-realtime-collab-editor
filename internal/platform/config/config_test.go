@@ -3,6 +3,7 @@ package config
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestProductionRequiresMySQL(t *testing.T) {
@@ -236,4 +237,32 @@ func setValidRuntimeEnvironment(t *testing.T) {
 	t.Setenv("QUIC_TLS_KEY_FILE", "server.key")
 	t.Setenv("QUIC_CA_FILE", "ca.crt")
 	t.Setenv("REDIS_PASSWORD", "redis-test-password")
+}
+
+func TestRoomRecoveryAdmissionConfiguration(t *testing.T) {
+	setValidRuntimeEnvironment(t)
+	t.Setenv("ROOM_RECOVERY_CONCURRENCY", "")
+	t.Setenv("ROOM_RECOVERY_QUEUE_SIZE", "")
+	t.Setenv("ROOM_RECOVERY_TIMEOUT", "")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.RoomRecoveryConcurrency != 4 || cfg.RoomRecoveryQueueSize != 32 || cfg.RoomRecoveryTimeout != 10*time.Second {
+		t.Fatalf("unexpected recovery defaults: %d, %d, %s", cfg.RoomRecoveryConcurrency, cfg.RoomRecoveryQueueSize, cfg.RoomRecoveryTimeout)
+	}
+	t.Setenv("ROOM_RECOVERY_CONCURRENCY", "0")
+	t.Setenv("ROOM_RECOVERY_QUEUE_SIZE", "0")
+	cfg, err = Load()
+	if err != nil || cfg.RoomRecoveryConcurrency != 0 || cfg.RoomRecoveryQueueSize != 0 {
+		t.Fatalf("zero recovery settings were not accepted: %d, %d, %v", cfg.RoomRecoveryConcurrency, cfg.RoomRecoveryQueueSize, err)
+	}
+	for _, key := range []string{"ROOM_RECOVERY_CONCURRENCY", "ROOM_RECOVERY_QUEUE_SIZE", "ROOM_RECOVERY_TIMEOUT"} {
+		t.Run(key, func(t *testing.T) {
+			t.Setenv(key, "-1")
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), key) {
+				t.Fatalf("expected validation error for %s, got %v", key, err)
+			}
+		})
+	}
 }

@@ -2,12 +2,16 @@ package browser
 
 import (
 	"context"
+	"errors"
 	"io"
 	"strconv"
 	"sync"
 	"testing"
 	"time"
 
+	memory "github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/adapter/memory/documents"
+	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/app/room"
+	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/domain/cluster"
 	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/domain/collab"
 	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/protocol"
 )
@@ -61,6 +65,54 @@ func (connection *recordingMessageConn) CloseNow() error {
 	connection.closed = true
 	connection.mu.Unlock()
 	return nil
+}
+
+type changingOwner struct {
+	candidate cluster.Owner
+	resolved  cluster.Owner
+	err       error
+}
+
+func (r changingOwner) EnsureOwner(context.Context, string) (cluster.Owner, error) {
+	return r.candidate, nil
+}
+func (r changingOwner) Resolve(context.Context, string) (cluster.Owner, error) {
+	return r.resolved, r.err
+}
+
+func TestColdRoomRequiresActiveLocalOwnerAfterRecovery(t *testing.T) {
+	ctx := context.Background()
+	store := memory.NewMemory()
+	if _, err := store.CreateDocument(ctx, "doc", "private", "alice"); err != nil {
+		t.Fatal(err)
+	}
+	manager := room.NewManager(store)
+	t.Cleanup(func() { _ = manager.Shutdown(ctx) })
+	local := cluster.Node{NodeID: "node", Incarnation: "first"}
+	candidate := cluster.Owner{NodeID: local.NodeID, Incarnation: local.Incarnation, State: cluster.OwnerAcquiring}
+	for _, tt := range []struct {
+		name     string
+		resolver changingOwner
+	}{
+		{"still recovering", changingOwner{candidate: candidate, resolved: cluster.Owner{NodeID: "node", Incarnation: "first", State: cluster.OwnerRecovering}}},
+		{"new incarnation", changingOwner{candidate: candidate, resolved: cluster.Owner{NodeID: "node", Incarnation: "second", State: cluster.OwnerActive}}},
+		{"ownership lost", changingOwner{candidate: candidate, err: errors.New("owner unavailable")}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			client := sessionClient{config: Config{Manager: manager, LocalNode: local, OwnerResolver: tt.resolver}, send: make(chan protocol.Message, 1)}
+			if client.selectDocument(ctx, protocol.Message{Type: protocol.TypeJoin, DocID: "doc"}) || client.joined || client.room != nil {
+				t.Fatal("accepted selection without active local ownership")
+			}
+			select {
+			case m := <-client.send:
+				if m.Code != protocol.CodeServiceUnavailable {
+					t.Fatalf("unexpected response %#v", m)
+				}
+			default:
+				t.Fatal("missing selection error")
+			}
+		})
+	}
 }
 
 func TestCursorBurstKeepsReliableQueueAvailable(t *testing.T) {

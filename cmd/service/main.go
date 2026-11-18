@@ -326,6 +326,11 @@ func newApplication(runtimeConfig config.Config, store storage.Store, authentica
 		SnapshotInterval:     runtimeConfig.SnapshotInterval,
 		MaxHistoryOperations: runtimeConfig.MaxHistoryOperations,
 		SnapshotTimeout:      runtimeConfig.SnapshotTimeout,
+
+		RoomRecoveryConcurrency: runtimeConfig.RoomRecoveryConcurrency,
+		RoomRecoveryQueueSize:   runtimeConfig.RoomRecoveryQueueSize,
+		RoomRecoveryTimeout:     runtimeConfig.RoomRecoveryTimeout,
+
 		Ownership:            ownership,
 		OwnerResolver:        ownership,
 		LocalNode:            runtimeConfig.Cluster.Node,

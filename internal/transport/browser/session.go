@@ -174,7 +174,7 @@ func (client *sessionClient) run(parent context.Context) {
 	}
 	for {
 		var message protocol.Message
-		if err := client.connection.Read(ctx, &message); err != nil || !client.process(message) {
+		if err := client.connection.Read(ctx, &message); err != nil || !client.process(ctx, message) {
 			return
 		}
 	}
@@ -215,8 +215,8 @@ func (client *sessionClient) authenticate(parent context.Context) bool {
 	return client.TrySend(protocol.Message{Type: protocol.TypeAuthOK, LocalCursorTransform: client.localCursors})
 }
 
-func (client *sessionClient) process(message protocol.Message) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), client.config.OperationTimeout)
+func (client *sessionClient) process(parent context.Context, message protocol.Message) bool {
+	ctx, cancel := context.WithTimeout(parent, client.config.OperationTimeout)
 	defer cancel()
 	release := func() {}
 	var err error
@@ -254,20 +254,35 @@ func (client *sessionClient) selectDocument(ctx context.Context, message protoco
 		client.sendError(protocol.CodeBadMessage, "a valid document may only be selected once")
 		return true
 	}
-	if client.config.OwnerResolver != nil {
-		owner, err := client.config.OwnerResolver.EnsureOwner(ctx, message.DocID)
-		if err != nil || owner.State != cluster.OwnerActive {
+	resolver := client.config.OwnerResolver
+	if resolver != nil {
+		owner, err := resolver.EnsureOwner(ctx, message.DocID)
+		if err != nil {
 			client.sendError(protocol.CodeServiceUnavailable, "document owner is unavailable")
 			return false
 		}
-		if owner.NodeID != client.config.LocalNode.NodeID || owner.Incarnation != client.config.LocalNode.Incarnation {
+		// A cold document has a preferred node before it has an active owner.
+		switch owner.State {
+		case cluster.OwnerAcquiring, cluster.OwnerRecovering, cluster.OwnerActive:
+		default:
+			client.sendError(protocol.CodeServiceUnavailable, "document owner is unavailable")
+			return false
+		}
+		if !client.isLocalOwner(owner) {
 			return client.redirectToOwner(ctx, message.DocID, owner)
 		}
 	}
-	target, err := client.config.Manager.Room(message.DocID)
+	target, err := client.config.Manager.RoomContext(ctx, message.DocID)
 	if err != nil {
 		client.sendRoomError(err, "could not open document")
 		return false
+	}
+	if resolver != nil {
+		owner, err := resolver.Resolve(ctx, message.DocID)
+		if err != nil || owner.State != cluster.OwnerActive || !client.isLocalOwner(owner) {
+			client.sendError(protocol.CodeServiceUnavailable, "document owner is unavailable")
+			return false
+		}
 	}
 	client.room, client.docID = target, message.DocID
 	if message.Type == protocol.TypeJoin {
@@ -281,6 +296,10 @@ func (client *sessionClient) selectDocument(ctx context.Context, message protoco
 	}
 	client.joined = true
 	return true
+}
+
+func (client *sessionClient) isLocalOwner(owner cluster.Owner) bool {
+	return owner.NodeID == client.config.LocalNode.NodeID && owner.Incarnation == client.config.LocalNode.Incarnation
 }
 
 func (client *sessionClient) redirectToOwner(ctx context.Context, docID string, owner cluster.Owner) bool {

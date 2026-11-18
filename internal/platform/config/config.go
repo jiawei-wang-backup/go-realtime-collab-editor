@@ -43,11 +43,16 @@ type Config struct {
 	SnapshotInterval     int
 	MaxHistoryOperations int
 	SnapshotTimeout      time.Duration
-	QUIC                 QUICConfig
-	WebTransport         WebTransportConfig
-	Cluster              ClusterConfig
-	Security             SecurityConfig
-	Execution            ExecutionConfig
+
+	RoomRecoveryConcurrency int
+	RoomRecoveryQueueSize   int
+	RoomRecoveryTimeout     time.Duration
+
+	QUIC         QUICConfig
+	WebTransport WebTransportConfig
+	Cluster      ClusterConfig
+	Security     SecurityConfig
+	Execution    ExecutionConfig
 }
 
 type ExecutionConfig struct {
@@ -188,6 +193,15 @@ func Load() (Config, error) {
 	config.SnapshotInterval = snapshotInterval
 	config.MaxHistoryOperations = maxHistory
 	config.SnapshotTimeout = snapshotTimeout
+	if config.RoomRecoveryConcurrency, err = nonNegativeInt("ROOM_RECOVERY_CONCURRENCY", 4); err != nil {
+		return Config{}, err
+	}
+	if config.RoomRecoveryQueueSize, err = nonNegativeInt("ROOM_RECOVERY_QUEUE_SIZE", 32); err != nil {
+		return Config{}, err
+	}
+	if config.RoomRecoveryTimeout, err = duration("ROOM_RECOVERY_TIMEOUT", 10*time.Second); err != nil {
+		return Config{}, err
+	}
 	if config.Environment == "production" && (config.StorageDriver != StorageMySQL || config.AuthMode != "jwt") {
 		return Config{}, fmt.Errorf("production requires STORAGE_DRIVER=mysql and AUTH_MODE=jwt")
 	}
