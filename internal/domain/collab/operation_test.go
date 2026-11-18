@@ -54,3 +54,27 @@ func TestApplyDeleteUsesRuneOffsets(t *testing.T) {
 		t.Fatalf("Apply() = %q, want %q", got, "ab")
 	}
 }
+
+func TestApplySplicesAtCodePointBoundaries(t *testing.T) {
+	for _, tc := range []struct {
+		name, content string
+		op            Operation
+		want          string
+	}{
+		{"insert into empty", "", Operation{Kind: OperationInsert, Text: "🙂"}, "🙂"},
+		{"insert before combining mark", "中e\u0301🙂", Operation{Kind: OperationInsert, Position: 2, Text: "!"}, "中e!\u0301🙂"},
+		{"append after emoji", "中🙂", Operation{Kind: OperationInsert, Position: 2, Text: "a"}, "中🙂a"},
+		{"delete to end", "a中🙂", Operation{Kind: OperationDelete, Position: 1, Length: 2}, "a"},
+		{"delete all", "中🙂", Operation{Kind: OperationDelete, Length: 2}, ""},
+		{"adjacent invalid bytes", "\xc2", Operation{Kind: OperationInsert, Position: 1, Text: "\x80"}, "��"},
+		{"delete between invalid bytes", "\xc2a\x80", Operation{Kind: OperationDelete, Position: 1, Length: 1}, "��"},
+		{"empty deletion normalizes invalid bytes", "\xff\xff", Operation{Kind: OperationDelete, Position: 2}, "��"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := Apply(tc.content, tc.op)
+			if err != nil || got != tc.want {
+				t.Fatalf("Apply = %q, %v; want %q", got, err, tc.want)
+			}
+		})
+	}
+}

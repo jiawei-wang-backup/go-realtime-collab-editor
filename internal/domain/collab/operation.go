@@ -2,6 +2,7 @@ package collab
 
 import (
 	"fmt"
+	"strings"
 	"unicode/utf8"
 )
 
@@ -66,21 +67,42 @@ func Apply(content string, op Operation) (string, error) {
 		return "", err
 	}
 
-	runes := []rune(content)
-	switch op.Kind {
-	case OperationInsert:
-		inserted := []rune(op.Text)
-		result := make([]rune, 0, len(runes)+len(inserted))
-		result = append(result, runes[:op.Position]...)
-		result = append(result, inserted...)
-		result = append(result, runes[op.Position:]...)
-		return string(result), nil
-	case OperationDelete:
-		result := make([]rune, 0, len(runes)-op.Length)
-		result = append(result, runes[:op.Position]...)
-		result = append(result, runes[op.Position+op.Length:]...)
-		return string(result), nil
-	default:
-		return "", fmt.Errorf("unsupported operation kind %q", op.Kind)
+	// 原有的 rune 转换会把每个无效字节替换为 U+FFFD。先分别处理两段输入，
+	// 避免拼接处的无效字节组合成另一个字符。
+	content = normalizeEditText(content)
+	inserted := normalizeEditText(op.Text)
+	if op.Kind == OperationDelete && op.Length == 0 {
+		return content, nil
 	}
+	start := byteOffset(content, op.Position)
+	end := start
+	if op.Kind == OperationDelete {
+		end += byteOffset(content[start:], op.Length)
+	}
+
+	// 一次分配结果，即使只保留很小的前缀或后缀也能释放旧正文。
+	var result strings.Builder
+	result.Grow(len(content) - (end - start) + len(inserted))
+	result.WriteString(content[:start])
+	result.WriteString(inserted)
+	result.WriteString(content[end:])
+	return result.String(), nil
+}
+
+func normalizeEditText(text string) string {
+	if utf8.ValidString(text) {
+		return text
+	}
+	return string([]rune(text))
+}
+
+// 调用前已校验字符位置，遍历到末尾时返回 EOF 对应的字节位置。
+func byteOffset(text string, characters int) int {
+	for offset := range text {
+		if characters == 0 {
+			return offset
+		}
+		characters--
+	}
+	return len(text)
 }
