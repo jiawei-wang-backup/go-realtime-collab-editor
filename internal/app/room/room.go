@@ -9,6 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/domain/collab"
 	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/domain/permission"
@@ -24,6 +25,7 @@ type Room struct {
 	cursors        map[Connection]protocol.CursorState
 	clientCount    atomic.Int64
 	document       collab.Document
+	contentRunes   int
 	history        []collab.AppliedOperation
 	historyFloor   uint64
 	latestSnapshot storage.Snapshot
@@ -66,6 +68,7 @@ func newRoom(
 		clients:          make(map[Connection]struct{}),
 		cursors:          make(map[Connection]protocol.CursorState),
 		document:         document,
+		contentRunes:     utf8.RuneCountInString(document.Content),
 		history:          history,
 		historyFloor:     latestSnapshot.Version,
 		latestSnapshot:   latestSnapshot,
@@ -485,16 +488,12 @@ func (r *Room) transformCursor(cursor protocol.CursorState) (protocol.CursorStat
 	if cursor.Anchor < 0 || cursor.Head < 0 || cursor.Version > r.document.Version || cursor.Version < r.historyFloor {
 		return protocol.CursorState{}, &CodedError{Code: protocol.CodeBadMessage, Message: "cursor version or position is invalid"}
 	}
-	for _, applied := range r.history {
-		if applied.Version <= cursor.Version {
-			continue
-		}
+	for _, applied := range r.historyAfter(cursor.Version) {
 		cursor.Anchor = transformCursorPosition(cursor.Anchor, applied.Operation)
 		cursor.Head = transformCursorPosition(cursor.Head, applied.Operation)
 	}
 	cursor.Version = r.document.Version
-	contentLength := len([]rune(r.document.Content))
-	if cursor.Anchor > contentLength || cursor.Head > contentLength {
+	if cursor.Anchor > r.contentRunes || cursor.Head > r.contentRunes {
 		return protocol.CursorState{}, &CodedError{Code: protocol.CodeBadMessage, Message: "cursor position is outside document"}
 	}
 	return cursor, nil
@@ -636,6 +635,12 @@ func (r *Room) handleEdit(event editEvent) {
 	}
 
 	r.document = nextDocument
+	switch applied.Kind {
+	case collab.OperationInsert:
+		r.contentRunes += utf8.RuneCountInString(applied.Text)
+	case collab.OperationDelete:
+		r.contentRunes -= applied.Length
+	}
 	r.history = append(r.history, applied)
 	if !r.refreshPermissions() {
 		event.reply <- ErrRoomClosed
@@ -814,14 +819,18 @@ func (r *Room) retrySnapshotAfter(delay time.Duration) {
 	}
 }
 
-func (r *Room) versionedOperationsAfter(version uint64) []protocol.VersionedOperation {
+func (r *Room) historyAfter(version uint64) []collab.AppliedOperation {
 	if len(r.history) == 0 || version >= r.history[len(r.history)-1].Version {
-		return []protocol.VersionedOperation{}
+		return nil
 	}
 	first := sort.Search(len(r.history), func(i int) bool {
 		return r.history[i].Version > version
 	})
-	missing := r.history[first:]
+	return r.history[first:]
+}
+
+func (r *Room) versionedOperationsAfter(version uint64) []protocol.VersionedOperation {
+	missing := r.historyAfter(version)
 	operations := make([]protocol.VersionedOperation, len(missing))
 	for i, applied := range missing {
 		operation := applied.Operation

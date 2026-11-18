@@ -152,3 +152,36 @@ func waitForMessageType(t *testing.T, messages <-chan protocol.Message, messageT
 		}
 	}
 }
+
+func TestCursorBoundsFollowCommittedUnicodeEdits(t *testing.T) {
+	target, editor := newTestRoom(t, "甲🙂乙")
+	cursor := &cursorTestClient{Client: &Client{UserID: "owner", Send: make(chan protocol.Message, 32)}}
+	if err := target.Join(cursor); err != nil {
+		t.Fatal(err)
+	}
+	var sequence uint64
+	checkEnd := func(version uint64, end int) {
+		t.Helper()
+		sequence++
+		position := protocol.CursorState{Version: version, Anchor: end, Head: end, Sequence: sequence}
+		if err := target.SubmitCursorContext(context.Background(), cursor, position); err != nil {
+			t.Fatalf("valid end at version %d: %v", version, err)
+		}
+		position.Sequence++
+		sequence++
+		position.Head++
+		assertCode(t, target.SubmitCursorContext(context.Background(), cursor, position), protocol.CodeBadMessage)
+	}
+	checkEnd(0, 3)
+	insert := collab.Operation{Kind: collab.OperationInsert, Position: 1, Text: "好🚀"}
+	if err := target.SubmitEdit(editor, "insert", insert); err != nil {
+		t.Fatal(err)
+	}
+	checkEnd(1, 5)
+
+	// 旧版本删除的范围跨过新插入的两个字符，实际删除长度由 OT 决定。
+	if err := target.SubmitEdit(editor, "delete", collab.Operation{BaseVersion: 0, Kind: collab.OperationDelete, Length: 2}); err != nil {
+		t.Fatal(err)
+	}
+	checkEnd(2, 1)
+}

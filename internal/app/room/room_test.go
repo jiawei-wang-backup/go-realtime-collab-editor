@@ -510,6 +510,13 @@ func TestEditStorageFailureDoesNotChangeRoomOrBroadcast(t *testing.T) {
 	if document := target.Snapshot(); document.Content != "abc" || document.Version != 0 {
 		t.Fatalf("room changed after failed commit: %#v", document)
 	}
+	cursor := &cursorTestClient{Client: &Client{UserID: "owner", Send: make(chan protocol.Message, 8)}}
+	if err := target.Join(cursor); err != nil {
+		t.Fatal(err)
+	}
+	assertCode(t, target.SubmitCursorContext(context.Background(), cursor, protocol.CursorState{
+		Anchor: 4, Head: 4, Sequence: 1,
+	}), protocol.CodeBadMessage)
 	document, err := base.GetDocument(context.Background(), "doc")
 	if err != nil {
 		t.Fatal(err)
