@@ -1,6 +1,9 @@
 package collab
 
-import "fmt"
+import (
+	"fmt"
+	"unicode/utf8"
+)
 
 type OperationKind string
 
@@ -31,8 +34,8 @@ type AppliedOperation struct {
 }
 
 func (op Operation) Validate(content string) error {
-	runes := []rune(content)
-	if op.Position < 0 || op.Position > len(runes) {
+	runeCount := utf8.RuneCountInString(content)
+	if op.Position < 0 || op.Position > runeCount {
 		return fmt.Errorf("position %d is outside document", op.Position)
 	}
 
@@ -48,7 +51,7 @@ func (op Operation) Validate(content string) error {
 		if op.Text != "" {
 			return fmt.Errorf("delete text must be empty")
 		}
-		if op.Length < 0 || op.Length > len(runes)-op.Position {
+		if op.Length < 0 || op.Length > runeCount-op.Position {
 			return fmt.Errorf("delete range is outside document")
 		}
 	default:
