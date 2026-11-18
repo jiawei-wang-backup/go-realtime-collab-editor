@@ -51,6 +51,7 @@ export type RealtimeMessageType =
   | 'error'
 
 export interface RealtimeMessage {
+  local_cursor_transform?: boolean
   type: RealtimeMessageType
   request_id?: string
   doc_id?: string

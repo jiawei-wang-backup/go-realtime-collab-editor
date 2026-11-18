@@ -1,4 +1,4 @@
-import type { Operation } from '../types/protocol'
+import type { CursorState, Operation } from '../types/protocol'
 
 export function codePoints(value: string): string[] { return Array.from(value) }
 
@@ -55,4 +55,12 @@ export function transformOperation(incoming: Operation, applied: Operation): Ope
 		transformed.length = Math.max(0, end - start)
 	}
 	return transformed
+}
+
+export function moveCursor<T extends Pick<CursorState, 'anchor' | 'head'>>(cursor: T, operation: Operation): T {
+  const inserted = operation.kind === 'insert' ? codePoints(operation.text ?? '').length : 0
+  const move = (offset: number) => operation.kind === 'delete'
+    ? positionOverDelete(offset, operation.position, operation.length ?? 0)
+    : offset + (offset >= operation.position ? inserted : 0)
+  return { ...cursor, anchor: move(cursor.anchor), head: move(cursor.head) }
 }

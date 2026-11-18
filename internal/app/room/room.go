@@ -489,8 +489,7 @@ func (r *Room) transformCursor(cursor protocol.CursorState) (protocol.CursorStat
 		return protocol.CursorState{}, &CodedError{Code: protocol.CodeBadMessage, Message: "cursor version or position is invalid"}
 	}
 	for _, applied := range r.historyAfter(cursor.Version) {
-		cursor.Anchor = transformCursorPosition(cursor.Anchor, applied.Operation)
-		cursor.Head = transformCursorPosition(cursor.Head, applied.Operation)
+		cursor = cursor.AfterEdit(applied.Operation, applied.Version)
 	}
 	cursor.Version = r.document.Version
 	if cursor.Anchor > r.contentRunes || cursor.Head > r.contentRunes {
@@ -499,32 +498,31 @@ func (r *Room) transformCursor(cursor protocol.CursorState) (protocol.CursorStat
 	return cursor, nil
 }
 
-func transformCursorPosition(position int, operation collab.Operation) int {
-	switch operation.Kind {
-	case collab.OperationInsert:
-		if operation.Position <= position {
-			return position + len([]rune(operation.Text))
+func (r *Room) transformStoredCursors(operation collab.Operation) {
+	if len(r.cursors) == 0 {
+		return
+	}
+	// 每次编辑只筛选一次旧客户端，新客户端根据 edit_applied 自行移动光标。
+	var legacy []Connection
+	for client := range r.clients {
+		if c, ok := client.(interface{ DerivesCursorPositions() bool }); ok && c.DerivesCursorPositions() {
+			continue
 		}
-	case collab.OperationDelete:
-		end := operation.Position + operation.Length
-		if position >= end {
-			return position - operation.Length
-		}
-		if position > operation.Position {
-			return operation.Position
+		if c, ok := client.(CursorClient); ok && c.SupportsCursor() {
+			legacy = append(legacy, client)
 		}
 	}
-	return position
-}
-
-func (r *Room) transformStoredCursors(operation collab.Operation) {
-	for client, cursor := range r.cursors {
-		cursor.Anchor = transformCursorPosition(cursor.Anchor, operation)
-		cursor.Head = transformCursorPosition(cursor.Head, operation)
-		cursor.Version = r.document.Version
-		r.cursors[client] = cursor
-		current := cursor
-		r.broadcastCursor(protocol.Message{Type: protocol.TypeCursorChanged, DocID: r.docID, Cursor: &current}, client)
+	for owner, cursor := range r.cursors {
+		current := cursor.AfterEdit(operation, r.document.Version)
+		r.cursors[owner] = current
+		for _, peer := range legacy {
+			if peer == owner {
+				continue
+			}
+			if _, joined := r.clients[peer]; joined && !peer.TrySend(protocol.Message{Type: protocol.TypeCursorChanged, DocID: r.docID, Cursor: &current}) {
+				r.disconnect(peer, ErrSlowClient)
+			}
+		}
 	}
 }
 

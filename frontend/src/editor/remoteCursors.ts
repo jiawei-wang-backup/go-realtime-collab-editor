@@ -31,6 +31,8 @@ export function remoteCursorColor(userID: string): number {
 export class RemoteCursorDecorations {
   private readonly cursors = new Map<string, VisibleCursor>()
   private readonly decorations: editor.IEditorDecorationsCollection
+  private renderFrame?: number
+  private readonly modelListener: { dispose(): void }
   private readonly expiryTimer: number
 
   constructor(
@@ -38,6 +40,7 @@ export class RemoteCursorDecorations {
     private readonly monaco: Monaco,
   ) {
     this.decorations = editor.createDecorationsCollection()
+    this.modelListener = editor.onDidChangeModelContent(() => this.scheduleRender())
     this.expiryTimer = window.setInterval(() => this.removeExpired(), 5_000)
   }
 
@@ -49,15 +52,17 @@ export class RemoteCursorDecorations {
       username: cursor.username,
       lastSeen: Date.now(),
     })
-    this.render()
+    this.scheduleRender()
   }
 
   remove(userID: string): void {
-    if (this.cursors.delete(userID)) this.render()
+    if (this.cursors.delete(userID)) this.scheduleRender()
   }
 
   dispose(): void {
     window.clearInterval(this.expiryTimer)
+    this.modelListener.dispose()
+    if (this.renderFrame !== undefined) window.cancelAnimationFrame(this.renderFrame)
     this.cursors.clear()
     this.decorations.clear()
   }
@@ -71,7 +76,15 @@ export class RemoteCursorDecorations {
         changed = true
       }
     }
-    if (changed) this.render()
+    if (changed) this.scheduleRender()
+  }
+
+  private scheduleRender(): void {
+    if (this.renderFrame !== undefined) return
+    this.renderFrame = window.requestAnimationFrame(() => {
+      this.renderFrame = undefined
+      this.render()
+    })
   }
 
   private render(): void {

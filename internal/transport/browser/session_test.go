@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/domain/collab"
 	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/protocol"
 )
 
@@ -151,5 +152,19 @@ func (c *observedWrites) Write(ctx context.Context, m protocol.Message) error {
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
+	}
+}
+
+func TestQueuedCursorTracksEditWithoutMutatingSharedSnapshot(t *testing.T) {
+	client := sessionClient{localCursors: true, send: make(chan protocol.Message, 1), cursorReady: make(chan struct{}, 1)}
+	original := protocol.CursorState{UserID: "alice", Anchor: 4, Head: 2, Version: 7}
+	client.TrySend(protocol.Message{Type: protocol.TypeCursorChanged, Cursor: &original})
+	op := collab.Operation{Kind: collab.OperationInsert, Position: 2, Text: "😀"}
+	if !client.TrySend(protocol.Message{Type: protocol.TypeEditApplied, Operation: &op, Version: 8}) {
+		t.Fatal("edit not enqueued")
+	}
+	got := client.pendingCursors["alice"].state
+	if got.Version != 8 || got.Anchor != 5 || got.Head != 3 || original.Version != 7 || original.Anchor != 4 || original.Head != 2 {
+		t.Fatalf("queued=%+v shared=%+v", got, original)
 	}
 }

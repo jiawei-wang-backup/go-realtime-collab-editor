@@ -60,27 +60,54 @@ type CursorState struct {
 	Sequence uint64 `json:"sequence"`
 }
 
+// AfterEdit 将选区的两个端点分别映射到提交后的文档版本。
+func (c CursorState) AfterEdit(op collab.Operation, version uint64) CursorState {
+	c.Anchor = transformCursorPosition(c.Anchor, op)
+	c.Head = transformCursorPosition(c.Head, op)
+	c.Version = version
+	return c
+}
+
+func transformCursorPosition(position int, operation collab.Operation) int {
+	switch operation.Kind {
+	case collab.OperationInsert:
+		if operation.Position <= position {
+			return position + len([]rune(operation.Text))
+		}
+	case collab.OperationDelete:
+		end := operation.Position + operation.Length
+		if position >= end {
+			return position - operation.Length
+		}
+		if position > operation.Position {
+			return operation.Position
+		}
+	}
+	return position
+}
+
 type Message struct {
-	Type           string               `json:"type"`
-	RequestID      string               `json:"request_id,omitempty"`
-	DocID          string               `json:"doc_id,omitempty"`
-	BaseVersion    uint64               `json:"base_version,omitempty"`
-	LastVersion    uint64               `json:"last_version,omitempty"`
-	Version        uint64               `json:"version,omitempty"`
-	FromVersion    uint64               `json:"from_version,omitempty"`
-	ToVersion      uint64               `json:"to_version,omitempty"`
-	CurrentVersion uint64               `json:"current_version,omitempty"`
-	Content        string               `json:"content,omitempty"`
-	Role           permission.Role      `json:"role,omitempty"`
-	Operation      *collab.Operation    `json:"operation,omitempty"`
-	Operations     []VersionedOperation `json:"operations,omitempty"`
-	Snapshot       *Snapshot            `json:"snapshot,omitempty"`
-	Code           string               `json:"code,omitempty"`
-	Message        string               `json:"message,omitempty"`
-	Token          string               `json:"token,omitempty"`
-	Endpoint       string               `json:"endpoint,omitempty"`
-	UserIDs        []string             `json:"user_ids,omitempty"`
-	Cursor         *CursorState         `json:"cursor,omitempty"`
+	LocalCursorTransform bool                 `json:"local_cursor_transform,omitempty"`
+	Type                 string               `json:"type"`
+	RequestID            string               `json:"request_id,omitempty"`
+	DocID                string               `json:"doc_id,omitempty"`
+	BaseVersion          uint64               `json:"base_version,omitempty"`
+	LastVersion          uint64               `json:"last_version,omitempty"`
+	Version              uint64               `json:"version,omitempty"`
+	FromVersion          uint64               `json:"from_version,omitempty"`
+	ToVersion            uint64               `json:"to_version,omitempty"`
+	CurrentVersion       uint64               `json:"current_version,omitempty"`
+	Content              string               `json:"content,omitempty"`
+	Role                 permission.Role      `json:"role,omitempty"`
+	Operation            *collab.Operation    `json:"operation,omitempty"`
+	Operations           []VersionedOperation `json:"operations,omitempty"`
+	Snapshot             *Snapshot            `json:"snapshot,omitempty"`
+	Code                 string               `json:"code,omitempty"`
+	Message              string               `json:"message,omitempty"`
+	Token                string               `json:"token,omitempty"`
+	Endpoint             string               `json:"endpoint,omitempty"`
+	UserIDs              []string             `json:"user_ids,omitempty"`
+	Cursor               *CursorState         `json:"cursor,omitempty"`
 }
 
 // MarshalJSON preserves zero versions and empty content in the initial joined

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import { getDocument } from '../api/documents'
 import { runGoDocument } from '../api/execution'
@@ -89,6 +89,8 @@ export function EditorPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [decodedId, user])
 
+  const currentSelection = useCallback(() => sessionRef.current?.selectionForDisplay() ?? null, [])
+
   const connected = collaboration.connection === 'CONNECTED'
   const readOnly = collaboration.role === 'read' || collaboration.role === ''
   const fileName = file?.id === decodedId ? file.name : decodedId
@@ -135,7 +137,7 @@ export function EditorPage() {
       </header>
       <div className="editor-workspace">
         <aside className="file-panel"><div className="panel-title"><span>EXPLORER</span><QuickOpen userId={user?.id ?? ''} activeId={decodedId} onOpen={(id) => void openFile(id)} /><Link to="/" title="All documents"><Icon name="files" /></Link></div><EditorExplorer activeId={decodedId} onOpen={(id) => void openFile(id)} /><div className="file-panel-meta"><button type="button" className="ghost-button" onClick={() => setHistoryOpen(true)} disabled={!collaboration.role}>History</button><code>v{collaboration.version}</code></div></aside>
-        <main className="monaco-panel"><div className="monaco-editor-region">{collaboration.loading ? <LoadingState label="Opening document…" /> : collaboration.error ? <ErrorBanner message={collaboration.error} /> : <MonacoWorkspace value={collaboration.content} language={language} readOnly={readOnly} onChange={(value) => { void sessionRef.current?.updateContent(value) }} onMount={(editor, monaco) => {
+        <main className="monaco-panel"><div className="monaco-editor-region">{collaboration.loading ? <LoadingState label="Opening document…" /> : collaboration.error ? <ErrorBanner message={collaboration.error} /> : <MonacoWorkspace selection={currentSelection} value={collaboration.content} language={language} readOnly={readOnly} onChange={(value) => { void sessionRef.current?.updateContent(value) }} onMount={(editor, monaco, isSyncing) => {
           editorRef.current = editor
           selectionListenerRef.current?.dispose()
           cursorDecorationsRef.current?.dispose()
@@ -143,6 +145,7 @@ export function EditorPage() {
           cursorDecorationsRef.current = decorations
           for (const cursor of remoteCursorsRef.current.values()) decorations.update(cursor)
           selectionListenerRef.current = editor.onDidChangeCursorSelection((event) => {
+            if (isSyncing()) return
             const model = editor.getModel()
             if (!model) return
             const content = model.getValue()

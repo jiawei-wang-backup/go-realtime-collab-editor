@@ -61,6 +61,7 @@ func Serve(parent context.Context, connection MessageConn, config Config) {
 type sessionClient struct {
 	connection     MessageConn
 	config         Config
+	localCursors   bool
 	principal      identity.Principal
 	room           *room.Room
 	docID          string
@@ -84,6 +85,8 @@ func (client *sessionClient) SupportsPresence() bool { return true }
 func (client *sessionClient) SupportsCursor() bool   { return true }
 func (client *sessionClient) DisplayName() string    { return client.principal.Username }
 
+func (client *sessionClient) DerivesCursorPositions() bool { return client.localCursors }
+
 func (client *sessionClient) TrySend(message protocol.Message) bool {
 	client.mu.Lock()
 	defer client.mu.Unlock()
@@ -96,6 +99,17 @@ func (client *sessionClient) TrySend(message protocol.Message) bool {
 	}
 	select {
 	case client.send <- message:
+		// 可靠编辑可能越过排队中的主动移动。把尚未发送的快照也推进到同一版本，
+		// 否则新客户端将再也收不到那次移动。
+		if client.localCursors && message.Type == protocol.TypeEditApplied && message.Operation != nil {
+			for id, cursor := range client.pendingCursors {
+				if cursor.kind == protocol.TypeCursorChanged && cursor.state.Version+1 == message.Version {
+					state := cursor.state.AfterEdit(*message.Operation, message.Version)
+					cursor.state = &state
+					client.pendingCursors[id] = cursor
+				}
+			}
+		}
 		return true
 	default:
 		return false
@@ -194,10 +208,11 @@ func (client *sessionClient) authenticate(parent context.Context) bool {
 		return false
 	}
 	client.principal = principal
+	client.localCursors = message.LocalCursorTransform
 	if client.config.ConnectionRegistry != nil {
 		client.unregister = client.config.ConnectionRegistry.Register(principal.SessionID, client, func() { client.Close(identity.ErrSessionInvalid) })
 	}
-	return client.TrySend(protocol.Message{Type: protocol.TypeAuthOK})
+	return client.TrySend(protocol.Message{Type: protocol.TypeAuthOK, LocalCursorTransform: client.localCursors})
 }
 
 func (client *sessionClient) process(message protocol.Message) bool {

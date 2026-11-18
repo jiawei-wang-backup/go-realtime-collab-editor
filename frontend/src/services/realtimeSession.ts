@@ -3,7 +3,7 @@ import { getAccessToken } from '../api/client'
 import { useCollaborationStore } from '../stores/collaborationStore'
 import type { CursorState, RealtimeMessage } from '../types/protocol'
 import { createRequestId } from '../utils/requestId'
-import { applyOperation, diffOperations, transformOperation } from './operations'
+import { applyOperation, diffOperations, moveCursor, transformOperation } from './operations'
 import { commitRecoveryState, loadPending, loadRecoveryState, savePending, type PendingEdit } from './pendingEdits'
 import { connectRealtimeTransport, realtimeSeedCount, websocketURL, type RealtimeTransport } from './realtimeTransport'
 
@@ -38,6 +38,9 @@ export class RealtimeSession {
   private cursorHeartbeat: number | null = null
   private cursorSequence = 0
   private lastCursorSentAt = 0
+  private localCursorTransform = false
+  private readonly remoteCursors = new Map<string, CursorState>()
+  private cursorDirty = false
   private currentCursor: Pick<CursorState, 'anchor' | 'head'> | null = null
   private localChangesQueued = 0
   private localSaveError: Error | undefined
@@ -70,6 +73,7 @@ export class RealtimeSession {
 
   stop(): void {
     this.stopped = true
+    this.clearRemoteCursors()
     window.removeEventListener('offline', this.handleOffline)
     window.removeEventListener('online', this.handleOnline)
     if (this.reconnectTimer !== null) {
@@ -127,9 +131,23 @@ export class RealtimeSession {
     if (this.localSaveError) throw this.localSaveError
   }
 
+  selectionForDisplay() { return this.currentCursor }
+
   updateCursor(anchor: number, head: number): void {
+    this.cursorDirty = true
     this.currentCursor = { anchor, head }
     this.scheduleCursor()
+  }
+
+  private clearRemoteCursors(): void {
+    for (const id of this.remoteCursors.keys()) this.observer.cursorRemoved?.(id)
+    this.remoteCursors.clear()
+  }
+
+  private displayCursor(cursor: CursorState): void {
+    // 权威坐标只随已确认的操作前进。本地待确认编辑只影响显示，收到 ACK 后不会再移动一次。
+    const projected = this.pending.reduce((c, edit) => moveCursor(c, edit.operation), cursor)
+    this.observer.cursorChanged?.(projected)
   }
 
   private async persistLocalChange(next: string): Promise<void> {
@@ -151,6 +169,7 @@ export class RealtimeSession {
       optimistic = applyOperation(optimistic, operation)
     }
     state.setDocument(optimistic, state.version)
+    for (const cursor of this.remoteCursors.values()) this.displayCursor(cursor)
     this.updatePendingCount()
     this.sendNext()
   }
@@ -172,7 +191,7 @@ export class RealtimeSession {
       useCollaborationStore.getState().setTransport(transport.kind)
       this.reconnectAttempt = 0
       useCollaborationStore.getState().setConnection('AUTHENTICATING')
-      transport.send({ type: 'auth', token: getAccessToken() })
+      transport.send({ type: 'auth', token: getAccessToken(), local_cursor_transform: true })
     } catch (error) {
       if (this.stopped || generation !== this.connectionGeneration) return
       if (error instanceof Error && (error.message.includes('invalid endpoint') || error.message.includes('insecure endpoint'))) {
@@ -224,6 +243,8 @@ export class RealtimeSession {
     const state = useCollaborationStore.getState()
     switch (message.type) {
       case 'auth_ok':
+        this.clearRemoteCursors()
+        this.localCursorTransform = !!message.local_cursor_transform
         this.authRefreshAttempted = false
         state.setConnection('SYNCING')
         this.send({ type: this.hasJoined ? 'resume' : 'join', doc_id: this.documentId, last_version: this.confirmedVersion })
@@ -269,10 +290,20 @@ export class RealtimeSession {
         state.setParticipants(message.user_ids ?? [])
         break
       case 'cursor_changed':
-        if (message.cursor?.user_id && message.cursor.user_id !== this.userId) this.observer.cursorChanged?.(message.cursor)
+        if (message.cursor?.user_id && message.cursor.user_id !== this.userId) {
+          if (this.localCursorTransform && message.cursor.version !== this.confirmedVersion) {
+            this.disconnectAndReconnect('cursor version mismatch')
+            return
+          }
+          this.remoteCursors.set(message.cursor.user_id, message.cursor)
+          this.displayCursor(message.cursor)
+        }
         break
       case 'cursor_removed':
-        if (message.cursor?.user_id) this.observer.cursorRemoved?.(message.cursor.user_id)
+        if (message.cursor?.user_id) {
+          this.remoteCursors.delete(message.cursor.user_id)
+          this.observer.cursorRemoved?.(message.cursor.user_id)
+        }
         break
       case 'owner_redirect':
         if (!message.endpoint || this.redirectCount >= maxRedirects) {
@@ -342,6 +373,28 @@ export class RealtimeSession {
     if (!message.operation) return
     const state = useCollaborationStore.getState()
     const own = message.request_id && this.pending.some((item) => item.requestId === message.request_id)
+    const version = message.version
+    if (version === undefined || version > this.confirmedVersion + 1) {
+      this.disconnectAndReconnect('edit version gap')
+      return
+    }
+    if (version <= this.confirmedVersion) {
+      if (own && message.request_id) {
+        this.pending = this.pending.filter(item => item.requestId !== message.request_id)
+        this.inFlight = ''
+        await this.commitLocalState([message.request_id])
+        state.setDocument(this.withPending(this.confirmedContent), this.confirmedVersion)
+        this.updatePendingCount()
+        for (const cursor of this.remoteCursors.values()) this.displayCursor(cursor)
+        this.sendNext()
+      }
+      return
+    }
+    if (this.localCursorTransform) {
+      for (const [id, cursor] of this.remoteCursors) {
+        this.remoteCursors.set(id, { ...moveCursor(cursor, message.operation), version })
+      }
+    }
     this.confirmedContent = applyOperation(this.confirmedContent, message.operation)
     this.confirmedVersion = message.version ?? this.confirmedVersion
     if (!own) {
@@ -353,9 +406,15 @@ export class RealtimeSession {
       acknowledgedRequestIds.push(message.request_id)
       this.inFlight = ''
     }
+    const displayed = this.withPending(this.confirmedContent)
+    if (!own && this.currentCursor) {
+      const changes = this.pending.length ? diffOperations(state.content, displayed) : [message.operation]
+      this.currentCursor = changes.reduce((cursor, change) => moveCursor(cursor, change), this.currentCursor)
+    }
     await this.commitLocalState(acknowledgedRequestIds)
     this.updatePendingCount()
-    state.setDocument(this.withPending(this.confirmedContent), this.confirmedVersion)
+    state.setDocument(displayed, this.confirmedVersion)
+    if (this.localCursorTransform) for (const cursor of this.remoteCursors.values()) this.displayCursor(cursor)
     if (own) {
       this.sendNext()
       if (this.pending.length === 0) this.scheduleCursor()
@@ -385,10 +444,12 @@ export class RealtimeSession {
 
   private sendCurrentCursor(heartbeat: boolean): void {
     if (!this.currentCursor || this.pending.length > 0 || this.localChangesQueued > 0 || useCollaborationStore.getState().connection !== 'CONNECTED') return
+    if (!heartbeat && !this.cursorDirty) return
     if (!heartbeat && Date.now() - this.lastCursorSentAt < cursorThrottleMs) {
       this.scheduleCursor()
       return
     }
+    this.cursorDirty = false
     this.cursorSequence += 1
     this.lastCursorSentAt = Date.now()
     this.send({
