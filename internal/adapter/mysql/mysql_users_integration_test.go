@@ -11,6 +11,7 @@ import (
 
 	_ "github.com/go-sql-driver/mysql"
 	identity "github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/domain/authentication"
+	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/migration"
 )
 
 func mysqlUsers(t *testing.T) *MySQLUsers {
@@ -23,10 +24,13 @@ func mysqlUsers(t *testing.T) *MySQLUsers {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = db.Close() })
 	if err := db.PingContext(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = db.Close() })
+	if err := migration.Run(context.Background(), db, "../../../migrations"); err != nil {
+		t.Fatal(err)
+	}
 	return NewMySQLUsers(db)
 }
 func TestMySQLUsersCaseInsensitiveUniqueAndStatus(t *testing.T) {

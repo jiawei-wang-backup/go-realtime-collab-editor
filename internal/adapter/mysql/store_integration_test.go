@@ -22,6 +22,44 @@ import (
 
 var documentSequence atomic.Uint64
 
+func BenchmarkMySQLGetPermissions(b *testing.B) {
+	dsn := os.Getenv("MYSQL_TEST_DSN")
+	if dsn == "" {
+		b.Skip("MYSQL_TEST_DSN is not configured; skipping real MySQL benchmark")
+	}
+	ctx := context.Background()
+	store, err := mysqlstorage.Open(ctx, mysqlstorage.Config{
+		DSN: dsn, MaxOpenConns: 10, MaxIdleConns: 5,
+		ConnMaxLifetime: time.Minute, PingTimeout: 5 * time.Second, QueryTimeout: 5 * time.Second,
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { _ = store.Close() })
+	if err := migration.Run(ctx, store.DB(), "../../../migrations"); err != nil {
+		b.Fatal(err)
+	}
+	owner, viewer := uniqueDocumentID(), uniqueDocumentID()
+	folder := storage.Folder{ID: uniqueDocumentID(), Name: "Benchmark"}
+	if err := store.CreateFolder(ctx, folder, owner); err != nil {
+		b.Fatal(err)
+	}
+	if err := store.SetFolderPermission(ctx, folder.ID, owner, viewer, permission.RoleRead); err != nil {
+		b.Fatal(err)
+	}
+	docID := uniqueDocumentID()
+	if _, err := store.CreateFolderDocument(ctx, docID, "", owner, folder.ID, "bench.go"); err != nil {
+		b.Fatal(err)
+	}
+	b.ResetTimer()
+	for range b.N {
+		roles, err := store.GetPermissions(ctx, docID)
+		if err != nil || roles[owner] != permission.RoleOwner || roles[viewer] != permission.RoleRead {
+			b.Fatalf("permissions = %#v, err = %v", roles, err)
+		}
+	}
+}
+
 func TestMySQLFolderSharingFollowsFilesAndRevocation(t *testing.T) {
 	store := openIntegrationStore(t)
 	ctx := context.Background()
@@ -90,6 +128,28 @@ func TestMySQLFolderSharingFollowsFilesAndRevocation(t *testing.T) {
 	}
 	if _, err := store.GetPermission(ctx, docID, viewer); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("permission after revoke: %v", err)
+	}
+	if _, err := target.ReadDocumentContext(ctx, viewer); err == nil {
+		t.Fatal("room allowed reading after folder permission revocation")
+	}
+}
+
+func TestMySQLGetPermissionsDistinguishesEmptyDocumentFromMissingDocument(t *testing.T) {
+	store := openIntegrationStore(t)
+	ctx := context.Background()
+	docID := uniqueDocumentID()
+	if _, err := store.CreateDocument(ctx, docID, "", "owner"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().ExecContext(ctx, "DELETE FROM document_permissions WHERE document_id = ?", docID); err != nil {
+		t.Fatal(err)
+	}
+	roles, err := store.GetPermissions(ctx, docID)
+	if err != nil || len(roles) != 0 {
+		t.Fatalf("empty document permissions = %#v, err = %v", roles, err)
+	}
+	if _, err := store.GetPermissions(ctx, uniqueDocumentID()); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("missing document permissions error = %v", err)
 	}
 }
 

@@ -344,13 +344,6 @@ func (s *Store) GetPermission(ctx context.Context, docID, userID string) (permis
 func (s *Store) GetPermissions(ctx context.Context, docID string) (map[string]permission.Role, error) {
 	ctx, cancel := s.withTimeout(ctx)
 	defer cancel()
-	var exists int
-	if err := s.db.QueryRowContext(ctx, "SELECT 1 FROM documents WHERE id = ?", docID).Scan(&exists); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, storage.ErrNotFound
-		}
-		return nil, err
-	}
 	return getPermissions(ctx, s.db, docID)
 }
 
@@ -744,23 +737,32 @@ func documentPermissions(ctx context.Context, query queryer, docID string, overr
 			SELECT p.user_id, IF(p.role = 'write', 2, 1)
 			FROM folder_permissions p JOIN ancestors a ON a.id = p.folder_id
 		)
-		SELECT user_id, ELT(MAX(strength), 'read', 'write', 'owner') FROM grants GROUP BY user_id`, overrideFolder, folderID, docID, docID,
+		SELECT grants.user_id, ELT(MAX(grants.strength), 'read', 'write', 'owner')
+		FROM documents d LEFT JOIN grants ON TRUE
+		WHERE d.id = ?
+		GROUP BY grants.user_id`, overrideFolder, folderID, docID, docID, docID,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("load permissions: %w", err)
 	}
 	defer rows.Close()
 	result := make(map[string]permission.Role)
+	found := false
 	for rows.Next() {
-		var userID string
-		var role permission.Role
+		found = true
+		var userID, role sql.NullString
 		if err := rows.Scan(&userID, &role); err != nil {
 			return nil, fmt.Errorf("scan permission: %w", err)
 		}
-		result[userID] = role
+		if userID.Valid {
+			result[userID.String] = permission.Role(role.String)
+		}
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate permissions: %w", err)
+	}
+	if !found {
+		return nil, storage.ErrNotFound
 	}
 	return result, nil
 }
