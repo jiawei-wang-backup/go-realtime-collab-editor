@@ -33,6 +33,7 @@ type Metrics struct {
 	QUICEvents           *prometheus.CounterVec
 	RedisOperations      *prometheus.HistogramVec
 	RedisEvents          *prometheus.CounterVec
+	PresenceHeartbeats   prometheus.Gauge
 	MySQLOperations      *prometheus.HistogramVec
 	MySQLFailures        *prometheus.CounterVec
 	MySQLPool            *prometheus.GaugeVec
@@ -57,15 +58,17 @@ func NewMetrics() *Metrics {
 	metrics.QUICEvents = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "collab_quic_events_total", Help: "QUIC events by bounded event and result."}, []string{"event", "result"})
 	metrics.RedisOperations = prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "collab_redis_operation_duration_seconds", Help: "Redis operation duration by bounded operation.", Buckets: prometheus.DefBuckets}, []string{"operation"})
 	metrics.RedisEvents = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "collab_redis_events_total", Help: "Redis coordination events by bounded event and result."}, []string{"event", "result"})
+	metrics.PresenceHeartbeats = prometheus.NewGauge(prometheus.GaugeOpts{Name: "collab_presence_heartbeats_active", Help: "Active per-session Redis presence heartbeat workers."})
 	metrics.MySQLOperations = prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "collab_mysql_operation_duration_seconds", Help: "MySQL operation duration by bounded operation.", Buckets: prometheus.DefBuckets}, []string{"operation"})
 	metrics.MySQLFailures = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "collab_mysql_failures_total", Help: "MySQL failures by bounded type."}, []string{"type"})
 	metrics.MySQLPool = prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "collab_mysql_pool_connections", Help: "MySQL connection pool state."}, []string{"state"})
 	metrics.HTTPRequestDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "collab_http_request_duration_seconds", Help: "HTTP request latency by route class and status.", Buckets: prometheus.DefBuckets}, []string{"scope", "method", "status"})
 	metrics.registry.MustRegister(
+		prometheus.NewGoCollector(), prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}),
 		metrics.MembershipNodes, metrics.NodeReady, metrics.LeaseRenewalFailures, metrics.OwnershipAttempts,
 		metrics.ActiveRooms, metrics.ActiveClients, metrics.RoomQueueDepth, metrics.SlowClients,
 		metrics.SnapshotOperations, metrics.ReplayDuration, metrics.RecoveryDuration,
-		metrics.QUICConnections, metrics.QUICConnectionsTotal, metrics.QUICEvents, metrics.RedisOperations, metrics.RedisEvents,
+		metrics.QUICConnections, metrics.QUICConnectionsTotal, metrics.QUICEvents, metrics.RedisOperations, metrics.RedisEvents, metrics.PresenceHeartbeats,
 		metrics.MySQLOperations, metrics.MySQLFailures, metrics.MySQLPool, metrics.HTTPRequestDuration,
 	)
 	return metrics
@@ -141,6 +144,14 @@ func (metrics *Metrics) RedisOperation(operation string, duration time.Duration,
 
 func (metrics *Metrics) RedisEvent(event, result string) {
 	metrics.RedisEvents.WithLabelValues(event, result).Inc()
+	if event == "presence_heartbeat" {
+		switch result {
+		case "started":
+			metrics.PresenceHeartbeats.Inc()
+		case "stopped":
+			metrics.PresenceHeartbeats.Dec()
+		}
+	}
 }
 
 func (metrics *Metrics) InstrumentHTTP(scope string, next http.Handler) http.Handler {

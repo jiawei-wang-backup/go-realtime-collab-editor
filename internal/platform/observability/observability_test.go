@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -59,7 +60,9 @@ func TestMetricsUseOnlyBoundedLabelsAndInstrumentHTTP(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	seen := make(map[string]bool, len(families))
 	for _, family := range families {
+		seen[family.GetName()] = true
 		for _, metric := range family.Metric {
 			for _, label := range metric.Label {
 				for _, forbidden := range []string{"user_id", "doc_id", "document_id", "request_id"} {
@@ -70,6 +73,40 @@ func TestMetricsUseOnlyBoundedLabelsAndInstrumentHTTP(t *testing.T) {
 			}
 		}
 	}
+	for _, name := range []string{"go_goroutines", "go_memstats_heap_alloc_bytes"} {
+		if !seen[name] {
+			t.Errorf("missing runtime metric %s", name)
+		}
+	}
+	if runtime.GOOS == "linux" && !seen["process_resident_memory_bytes"] {
+		t.Error("missing Linux process resident memory metric")
+	}
+}
+
+func TestPresenceHeartbeatGaugeReturnsToZero(t *testing.T) {
+	metrics := NewMetrics()
+	metrics.RedisEvent("presence_heartbeat", "started")
+	metrics.RedisEvent("presence_heartbeat", "started")
+	metrics.RedisEvent("presence_heartbeat", "stopped")
+	check := func(want float64) {
+		t.Helper()
+		families, err := metrics.registry.Gather()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, family := range families {
+			if family.GetName() == "collab_presence_heartbeats_active" {
+				if got := family.Metric[0].GetGauge().GetValue(); got != want {
+					t.Fatalf("active heartbeats = %v, want %v", got, want)
+				}
+				return
+			}
+		}
+		t.Fatal("missing presence heartbeat gauge")
+	}
+	check(1)
+	metrics.RedisEvent("presence_heartbeat", "stopped")
+	check(0)
 }
 
 func TestHTTPInstrumentationPreservesWebSocketUpgrade(t *testing.T) {

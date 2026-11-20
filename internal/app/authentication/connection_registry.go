@@ -20,6 +20,7 @@ type ConnectionRegistry struct {
 	nodeID      string
 	presenceTTL time.Duration
 	observer    identity.Observer
+	closed      bool
 }
 
 type presenceHeartbeat struct {
@@ -49,6 +50,11 @@ func newCoordinatedConnectionRegistry(ctx context.Context, store identity.Distri
 
 func (registry *ConnectionRegistry) Register(sessionID string, key any, closeConnection func()) func() {
 	registry.mu.Lock()
+	if registry.closed {
+		registry.mu.Unlock()
+		closeConnection()
+		return func() {}
+	}
 	firstConnection := len(registry.connections[sessionID]) == 0
 	if registry.connections[sessionID] == nil {
 		registry.connections[sessionID] = map[any]func(){}
@@ -96,6 +102,9 @@ func (registry *ConnectionRegistry) SessionIDs() []string {
 }
 
 func (registry *ConnectionRegistry) Close() {
+	registry.mu.Lock()
+	registry.closed = true
+	registry.mu.Unlock()
 	for _, sessionID := range registry.SessionIDs() {
 		registry.CloseSession(sessionID)
 	}
@@ -115,6 +124,10 @@ func (registry *ConnectionRegistry) startPresenceLocked(sessionID string) {
 
 func (registry *ConnectionRegistry) runPresenceHeartbeat(ctx context.Context, sessionID string, heartbeat *presenceHeartbeat) {
 	defer close(heartbeat.done)
+	if registry.observer != nil {
+		registry.observer.RedisEvent("presence_heartbeat", "started")
+		defer registry.observer.RedisEvent("presence_heartbeat", "stopped")
+	}
 	interval := registry.presenceTTL / 3
 	if interval < time.Second {
 		interval = time.Second

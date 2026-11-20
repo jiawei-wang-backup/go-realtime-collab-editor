@@ -18,20 +18,23 @@ import (
 	"go.opentelemetry.io/otel"
 )
 
+const presenceBroadcastDelay = 50 * time.Millisecond
+
 type Room struct {
-	docID          string
-	events         chan event
-	clients        map[Connection]struct{}
-	cursors        map[Connection]protocol.CursorState
-	clientCount    atomic.Int64
-	document       collab.Document
-	contentRunes   int
-	history        []collab.AppliedOperation
-	historyFloor   uint64
-	latestSnapshot storage.Snapshot
-	permissions    map[string]permission.Role
-	storage        storage.Store
-	authority      storage.WriteAuthority
+	docID             string
+	events            chan event
+	clients           map[Connection]struct{}
+	presenceScheduled bool
+	cursors           map[Connection]protocol.CursorState
+	clientCount       atomic.Int64
+	document          collab.Document
+	contentRunes      int
+	history           []collab.AppliedOperation
+	historyFloor      uint64
+	latestSnapshot    storage.Snapshot
+	permissions       map[string]permission.Role
+	storage           storage.Store
+	authority         storage.WriteAuthority
 
 	ctx              context.Context
 	cancel           context.CancelFunc
@@ -159,6 +162,8 @@ func (r *Room) handle(roomEvent event) {
 		r.handleSnapshotSaved(current)
 	case snapshotRetryEvent:
 		r.maybeSaveSnapshot()
+	case presenceEvent:
+		r.broadcastPresence()
 	case permissionEvent:
 		r.handlePermission(current)
 	case readDocumentEvent:
@@ -175,15 +180,20 @@ func (r *Room) refreshPermissions() bool {
 	}
 	previous := r.permissions
 	r.permissions = current
+	presenceChanged := false
 	for client := range r.clients {
 		role := current[client.Identity()]
 		if !role.CanRead() {
 			r.disconnect(client, &CodedError{Code: protocol.CodePermissionDenied, Message: "read permission revoked"})
+			presenceChanged = true
 		} else if previous[client.Identity()] != role && !client.TrySend(protocol.Message{
 			Type: protocol.TypePermissionChanged, DocID: r.docID, Role: role,
 		}) {
 			r.disconnect(client, ErrSlowClient)
 		}
+	}
+	if presenceChanged {
+		r.queuePresenceUpdate()
 	}
 	return true
 }
@@ -369,7 +379,12 @@ func (r *Room) handleJoin(event joinEvent) {
 		event.reply <- ErrSlowClient
 		return
 	}
-	r.broadcastPresence()
+	if !r.sendCurrentPresence(event.client) {
+		r.disconnect(event.client, ErrSlowClient)
+		event.reply <- ErrSlowClient
+		return
+	}
+	r.queuePresenceUpdate()
 	r.sendCursorSnapshot(event.client)
 	event.reply <- nil
 }
@@ -400,7 +415,12 @@ func (r *Room) handleResume(event resumeEvent) {
 	}
 	r.clients[event.client] = struct{}{}
 	r.clientCount.Add(1)
-	r.broadcastPresence()
+	if !r.sendCurrentPresence(event.client) {
+		r.disconnect(event.client, ErrSlowClient)
+		event.reply <- ErrSlowClient
+		return
+	}
+	r.queuePresenceUpdate()
 	r.sendCursorSnapshot(event.client)
 	event.reply <- nil
 }
@@ -449,7 +469,7 @@ func (r *Room) handleLeave(event leaveEvent) {
 		delete(r.clients, event.client)
 		r.clientCount.Add(-1)
 		event.client.Close(nil)
-		r.broadcastPresence()
+		r.queuePresenceUpdate()
 	}
 	event.reply <- struct{}{}
 }
@@ -567,34 +587,56 @@ func (r *Room) removeCursor(client Connection) {
 	r.broadcastCursor(protocol.Message{Type: protocol.TypeCursorRemoved, DocID: r.docID, Cursor: &protocol.CursorState{UserID: cursor.UserID}}, client)
 }
 
+func (r *Room) currentPresence() protocol.Message {
+	unique := make(map[string]struct{}, len(r.clients))
+	for client := range r.clients {
+		unique[client.Identity()] = struct{}{}
+	}
+	userIDs := make([]string, 0, len(unique))
+	for userID := range unique {
+		userIDs = append(userIDs, userID)
+	}
+	sort.Strings(userIDs)
+	return protocol.Message{Type: protocol.TypePresenceChanged, DocID: r.docID, UserIDs: userIDs}
+}
+
+func (r *Room) sendCurrentPresence(client Connection) bool {
+	presenceClient, ok := client.(PresenceClient)
+	return !ok || !presenceClient.SupportsPresence() || client.TrySend(r.currentPresence())
+}
+
+// Room 串行处理成员变化；突发加入只登记一次更新，广播时再读取当前成员。
+func (r *Room) queuePresenceUpdate() {
+	if len(r.clients) == 0 || r.presenceScheduled {
+		return
+	}
+	r.presenceScheduled = true
+	time.AfterFunc(presenceBroadcastDelay, func() {
+		select {
+		case r.events <- presenceEvent{}:
+		case <-r.ctx.Done():
+		}
+	})
+}
+
 func (r *Room) broadcastPresence() {
-	for {
-		unique := make(map[string]struct{}, len(r.clients))
-		for client := range r.clients {
-			unique[client.Identity()] = struct{}{}
+	r.presenceScheduled = false
+	if len(r.clients) == 0 {
+		return
+	}
+	message := r.currentPresence()
+	var slowClients []Connection
+	for client := range r.clients {
+		presenceClient, ok := client.(PresenceClient)
+		if ok && presenceClient.SupportsPresence() && !client.TrySend(message) {
+			slowClients = append(slowClients, client)
 		}
-		userIDs := make([]string, 0, len(unique))
-		for userID := range unique {
-			userIDs = append(userIDs, userID)
-		}
-		sort.Strings(userIDs)
-		message := protocol.Message{Type: protocol.TypePresenceChanged, DocID: r.docID, UserIDs: userIDs}
-		var slowClients []Connection
-		for client := range r.clients {
-			presenceClient, ok := client.(PresenceClient)
-			if !ok || !presenceClient.SupportsPresence() {
-				continue
-			}
-			if !client.TrySend(message) {
-				slowClients = append(slowClients, client)
-			}
-		}
-		if len(slowClients) == 0 {
-			return
-		}
-		for _, client := range slowClients {
-			r.disconnect(client, ErrSlowClient)
-		}
+	}
+	for _, client := range slowClients {
+		r.disconnect(client, ErrSlowClient)
+	}
+	if len(slowClients) > 0 {
+		r.queuePresenceUpdate()
 	}
 }
 
@@ -961,6 +1003,8 @@ func (r *Room) rejectClosedEvent(roomEvent event) {
 	case snapshotSavedEvent:
 		return
 	case snapshotRetryEvent:
+		return
+	case presenceEvent:
 		return
 	case permissionEvent:
 		current.reply <- permissionResult{err: ErrRoomClosed}

@@ -40,6 +40,40 @@ func TestFinishDrainsTerminalMessageBeforeClosingConnection(t *testing.T) {
 	}
 }
 
+func TestConcurrentCloseStopsBrowserWriter(t *testing.T) {
+	connection := &recordingMessageConn{}
+	client := &sessionClient{
+		connection: connection,
+		send:       make(chan protocol.Message, 1),
+		writeDone:  make(chan struct{}),
+		config:     Config{WriteTimeout: time.Second},
+	}
+	go client.writeLoop(context.Background())
+	var callers sync.WaitGroup
+	for range 16 {
+		callers.Add(1)
+		go func() {
+			defer callers.Done()
+			client.Close(nil)
+		}()
+	}
+	callers.Wait()
+	select {
+	case <-client.writeDone:
+	case <-time.After(time.Second):
+		t.Fatal("browser writer survived concurrent Close")
+	}
+	if client.TrySend(protocol.Message{Type: protocol.TypeEditApplied}) {
+		t.Fatal("closed browser session accepted a message")
+	}
+	connection.mu.Lock()
+	closed := connection.closed
+	connection.mu.Unlock()
+	if !closed {
+		t.Fatal("transport remained open")
+	}
+}
+
 type recordingMessageConn struct {
 	mu       sync.Mutex
 	messages []protocol.Message
@@ -164,6 +198,36 @@ func TestCursorBurstKeepsReliableQueueAvailable(t *testing.T) {
 	close(client.send)
 	if _, ok := client.nextMessage(ctx); ok {
 		t.Fatal("unexpected extra cursor")
+	}
+}
+
+func TestPresenceBurstKeepsReliableQueueAvailable(t *testing.T) {
+	client := &sessionClient{send: make(chan protocol.Message, 3), presenceReady: make(chan struct{}, 1)}
+	for _, kind := range []string{protocol.TypeJoined, protocol.TypeEditApplied, protocol.TypePermissionChanged} {
+		if !client.TrySend(protocol.Message{Type: kind}) {
+			t.Fatalf("could not queue reliable message %s", kind)
+		}
+	}
+	for index := 0; index < 240; index++ {
+		if !client.TrySend(protocol.Message{Type: protocol.TypePresenceChanged, UserIDs: []string{strconv.Itoa(index)}}) {
+			t.Fatalf("presence update %d filled the reliable queue", index)
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	for _, kind := range []string{protocol.TypeJoined, protocol.TypeEditApplied, protocol.TypePermissionChanged} {
+		message, ok := client.nextMessage(ctx)
+		if !ok || message.Type != kind {
+			t.Fatalf("reliable message = %#v, want %s", message, kind)
+		}
+	}
+	message, ok := client.nextMessage(ctx)
+	if !ok || message.Type != protocol.TypePresenceChanged || len(message.UserIDs) != 1 || message.UserIDs[0] != "239" {
+		t.Fatalf("latest presence = %#v", message)
+	}
+	close(client.send)
+	if _, ok := client.nextMessage(ctx); ok {
+		t.Fatal("outdated presence remained queued")
 	}
 }
 

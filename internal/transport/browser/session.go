@@ -53,29 +53,32 @@ func Serve(parent context.Context, connection MessageConn, config Config) {
 	client := &sessionClient{
 		connection: connection, config: config,
 		send:        make(chan protocol.Message, config.SendQueueSize),
-		cursorReady: make(chan struct{}, 1), writeDone: make(chan struct{}),
+		cursorReady: make(chan struct{}, 1), presenceReady: make(chan struct{}, 1), writeDone: make(chan struct{}),
 	}
 	client.run(parent)
 }
 
 type sessionClient struct {
-	connection     MessageConn
-	config         Config
-	localCursors   bool
-	principal      identity.Principal
-	room           *room.Room
-	docID          string
-	send           chan protocol.Message
-	writeDone      chan struct{}
-	unregister     func()
-	mu             sync.Mutex
-	cursorReady    chan struct{}
-	cursorOrder    []string
-	pendingCursors map[string]pendingCursor
-	closed         bool
-	joined         bool
-	cursorWindow   time.Time
-	cursorMessages int
+	connection         MessageConn
+	config             Config
+	localCursors       bool
+	principal          identity.Principal
+	room               *room.Room
+	docID              string
+	send               chan protocol.Message
+	writeDone          chan struct{}
+	unregister         func()
+	mu                 sync.Mutex
+	cursorReady        chan struct{}
+	presenceReady      chan struct{}
+	pendingPresence    protocol.Message
+	hasPendingPresence bool
+	cursorOrder        []string
+	pendingCursors     map[string]pendingCursor
+	closed             bool
+	joined             bool
+	cursorWindow       time.Time
+	cursorMessages     int
 }
 
 var _ room.Connection = (*sessionClient)(nil)
@@ -92,6 +95,16 @@ func (client *sessionClient) TrySend(message protocol.Message) bool {
 	defer client.mu.Unlock()
 	if client.closed {
 		return false
+	}
+	// 在线名单是完整快照；突发加入时只需发送尚未发出的最新一份。
+	if message.Type == protocol.TypePresenceChanged {
+		client.pendingPresence = message
+		client.hasPendingPresence = true
+		select {
+		case client.presenceReady <- struct{}{}:
+		default:
+		}
+		return true
 	}
 	if message.Cursor != nil && (message.Type == protocol.TypeCursorChanged || message.Type == protocol.TypeCursorRemoved) {
 		client.queueCursor(message)
@@ -357,7 +370,7 @@ func (client *sessionClient) allowCursorMessage() bool {
 	return client.cursorMessages <= cursorMessagesPerSecond
 }
 
-// 唯一的写协程先取可靠消息，再取光标。取消息时与入队共用锁，
+// 唯一的写协程先取可靠消息，再取最新在线名单和光标。取消息时与入队共用锁，
 // 避免某个新版本的光标抢在对应的 edit_applied 前面发出。
 func (client *sessionClient) nextMessage(ctx context.Context) (protocol.Message, bool) {
 	for ctx.Err() == nil {
@@ -367,6 +380,13 @@ func (client *sessionClient) nextMessage(ctx context.Context) (protocol.Message,
 			client.mu.Unlock()
 			return message, ok
 		default:
+		}
+		if client.hasPendingPresence {
+			message := client.pendingPresence
+			client.pendingPresence = protocol.Message{}
+			client.hasPendingPresence = false
+			client.mu.Unlock()
+			return message, true
 		}
 		if len(client.cursorOrder) > 0 {
 			userID := client.cursorOrder[0]
@@ -381,6 +401,7 @@ func (client *sessionClient) nextMessage(ctx context.Context) (protocol.Message,
 		select {
 		case message, ok := <-client.send:
 			return message, ok
+		case <-client.presenceReady:
 		case <-client.cursorReady:
 		case <-ctx.Done():
 			return protocol.Message{}, false

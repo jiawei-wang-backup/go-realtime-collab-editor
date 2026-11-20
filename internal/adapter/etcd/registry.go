@@ -213,7 +213,9 @@ func (registry *Registry) run(ctx context.Context, keepAlive <-chan *clientv3.Le
 		registry.watchMembership(ctx, revision)
 	}()
 
-	confirmationTimer := time.NewTimer(leaseConfirmationWindow(registry.leaseTTL))
+	ttl := registry.leaseTTL
+	var lastAck time.Time
+	confirmationTimer := time.NewTimer(leaseConfirmationWindow(ttl))
 	defer confirmationTimer.Stop()
 	for {
 		select {
@@ -222,17 +224,23 @@ func (registry *Registry) run(ctx context.Context, keepAlive <-chan *clientv3.Le
 			return
 		case response, open := <-keepAlive:
 			if !open || response == nil || response.TTL <= 0 {
-				registry.reportLeaseLost()
+				reason := "keepalive_closed"
+				if open {
+					reason = "invalid_keepalive_response"
+				}
+				registry.reportLeaseLost(reason, lastAck, ttl)
 				registry.cancelRun()
 				<-watchDone
 				return
 			}
-			resetTimer(confirmationTimer, leaseConfirmationWindow(response.TTL))
+			lastAck = time.Now()
+			ttl = response.TTL
+			resetTimer(confirmationTimer, leaseConfirmationWindow(ttl))
 		case <-confirmationTimer.C:
 			// A KeepAlive TTL is the last evidence that the lease remains valid. Fail
 			// closed when the monotonic confirmation window expires instead of waiting
 			// for the network library to close the channel.
-			registry.reportLeaseLost()
+			registry.reportLeaseLost("confirmation_timeout", lastAck, ttl)
 			registry.cancelRun()
 			<-watchDone
 			return
@@ -374,7 +382,7 @@ func (registry *Registry) cancelRun() {
 	}
 }
 
-func (registry *Registry) reportLeaseLost() {
+func (registry *Registry) reportLeaseLost(reason string, lastAck time.Time, ttl int64) {
 	registry.mu.Lock()
 	observer := registry.observer
 	node := registry.node
@@ -382,7 +390,12 @@ func (registry *Registry) reportLeaseLost() {
 	if observer != nil {
 		observer.LeaseRenewalFailed()
 	}
-	slog.Error("cluster lease lost", "component", "cluster", "event", "lease_lost", "node_id", node.NodeID, "incarnation", node.Incarnation)
+	fields := []any{"component", "cluster", "event", "lease_lost", "node_id", node.NodeID, "incarnation", node.Incarnation,
+		"reason", reason, "lease_ttl_seconds", ttl, "confirmation_window_ms", leaseConfirmationWindow(ttl).Milliseconds(), "keepalive_received", !lastAck.IsZero()}
+	if !lastAck.IsZero() {
+		fields = append(fields, "since_last_keepalive_ms", time.Since(lastAck).Milliseconds())
+	}
+	slog.Error("cluster lease lost", fields...)
 	select {
 	case registry.lost <- ErrLeaseLost:
 	default:

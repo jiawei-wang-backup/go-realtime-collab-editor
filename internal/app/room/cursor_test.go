@@ -2,6 +2,7 @@ package room
 
 import (
 	"context"
+	"slices"
 	"testing"
 	"time"
 
@@ -20,6 +21,70 @@ type cursorTestClient struct {
 func (client *cursorTestClient) SupportsPresence() bool { return true }
 func (client *cursorTestClient) SupportsCursor() bool   { return true }
 func (client *cursorTestClient) DisplayName() string    { return client.username }
+
+func TestPresenceBurstEventuallyPublishesLatestMembership(t *testing.T) {
+	ctx := context.Background()
+	store := memory.NewMemory()
+	if _, err := store.CreateDocument(ctx, "doc", "", "owner"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ActivateOwnership(ctx, "doc", storage.LocalAuthority); err != nil {
+		t.Fatal(err)
+	}
+	for _, userID := range []string{"peer", "third"} {
+		if err := store.SetPermission(ctx, storage.PermissionCommit{
+			Authority: storage.LocalAuthority, DocumentID: "doc", ActorID: "owner", UserID: userID, Role: permission.RoleRead,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	manager := NewManager(store)
+	t.Cleanup(func() { _ = manager.Shutdown(context.Background()) })
+	target, err := manager.Room("doc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := func(userID string) *cursorTestClient {
+		return &cursorTestClient{Client: &Client{UserID: userID, Send: make(chan protocol.Message, 16)}, username: userID}
+	}
+	owner, peer, third := client("owner"), client("peer"), client("third")
+	for _, member := range []*cursorTestClient{owner, peer, third} {
+		if err := target.Join(member); err != nil {
+			t.Fatal(err)
+		}
+		if message := <-member.Send; message.Type != protocol.TypeJoined {
+			t.Fatalf("initial message = %#v", message)
+		}
+	}
+	waitForPresenceIDs(t, third.Send, []string{"owner", "peer", "third"})
+	waitForPresenceIDs(t, owner.Send, []string{"owner", "peer", "third"})
+	waitForPresenceIDs(t, peer.Send, []string{"owner", "peer", "third"})
+	if err := store.SetPermission(ctx, storage.PermissionCommit{
+		Authority: storage.LocalAuthority, DocumentID: "doc", ActorID: "owner", UserID: "peer",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := target.ReadDocumentContext(ctx, "peer"); err == nil {
+		t.Fatal("revoked user could still read")
+	}
+	waitForPresenceIDs(t, owner.Send, []string{"owner", "third"})
+}
+
+func waitForPresenceIDs(t *testing.T, messages <-chan protocol.Message, want []string) {
+	t.Helper()
+	timer := time.NewTimer(2 * time.Second)
+	defer timer.Stop()
+	for {
+		select {
+		case message := <-messages:
+			if message.Type == protocol.TypePresenceChanged && slices.Equal(message.UserIDs, want) {
+				return
+			}
+		case <-timer.C:
+			t.Fatalf("timed out waiting for presence %v", want)
+		}
+	}
+}
 
 func TestCursorStateTransformsWithEditsWithoutChangingDocumentVersion(t *testing.T) {
 	store := memory.NewMemory()

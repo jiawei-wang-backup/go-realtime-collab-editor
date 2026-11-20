@@ -40,23 +40,36 @@ func BenchmarkMySQLGetPermissions(b *testing.B) {
 		b.Fatal(err)
 	}
 	owner, viewer := uniqueDocumentID(), uniqueDocumentID()
-	folder := storage.Folder{ID: uniqueDocumentID(), Name: "Benchmark"}
-	if err := store.CreateFolder(ctx, folder, owner); err != nil {
-		b.Fatal(err)
-	}
-	if err := store.SetFolderPermission(ctx, folder.ID, owner, viewer, permission.RoleRead); err != nil {
-		b.Fatal(err)
-	}
-	docID := uniqueDocumentID()
-	if _, err := store.CreateFolderDocument(ctx, docID, "", owner, folder.ID, "bench.go"); err != nil {
-		b.Fatal(err)
-	}
-	b.ResetTimer()
-	for range b.N {
-		roles, err := store.GetPermissions(ctx, docID)
-		if err != nil || roles[owner] != permission.RoleOwner || roles[viewer] != permission.RoleRead {
-			b.Fatalf("permissions = %#v, err = %v", roles, err)
-		}
+	for _, depth := range []int{1, 4} {
+		b.Run(fmt.Sprintf("depth%d", depth), func(b *testing.B) {
+			parentID := ""
+			rootID := ""
+			for index := 0; index < depth; index++ {
+				folderID := uniqueDocumentID()
+				folder := storage.Folder{ID: folderID, ParentID: parentID, Name: "Benchmark-" + folderID}
+				if err := store.CreateFolder(ctx, folder, owner); err != nil {
+					b.Fatal(err)
+				}
+				if index == 0 {
+					rootID = folder.ID
+				}
+				parentID = folder.ID
+			}
+			if err := store.SetFolderPermission(ctx, rootID, owner, viewer, permission.RoleRead); err != nil {
+				b.Fatal(err)
+			}
+			docID := uniqueDocumentID()
+			if _, err := store.CreateFolderDocument(ctx, docID, "", owner, parentID, "bench.go"); err != nil {
+				b.Fatal(err)
+			}
+			b.ResetTimer()
+			for range b.N {
+				roles, err := store.GetPermissions(ctx, docID)
+				if err != nil || roles[owner] != permission.RoleOwner || roles[viewer] != permission.RoleRead {
+					b.Fatalf("permissions = %#v, err = %v", roles, err)
+				}
+			}
+		})
 	}
 }
 

@@ -341,7 +341,9 @@ func (s *Store) GetPermission(ctx context.Context, docID, userID string) (permis
 	return role, nil
 }
 
-func (s *Store) GetPermissions(ctx context.Context, docID string) (map[string]permission.Role, error) {
+func (s *Store) GetPermissions(ctx context.Context, docID string) (roles map[string]permission.Role, resultErr error) {
+	started := time.Now()
+	defer func() { s.observe("get_permissions", started, resultErr) }()
 	ctx, cancel := s.withTimeout(ctx)
 	defer cancel()
 	return getPermissions(ctx, s.db, docID)

@@ -14,7 +14,21 @@ CONTAINERS=()
 
 log() { printf '%s\n' "$*" | tee -a "$REPORT"; }
 random_port() {
-  python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()'
+  python3 -c 'import socket
+while True:
+    tcp = socket.socket()
+    tcp.bind(("127.0.0.1", 0))
+    port = tcp.getsockname()[1]
+    udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        udp.bind(("127.0.0.1", port))
+        print(port)
+        break
+    except OSError:
+        pass
+    finally:
+        udp.close()
+        tcp.close()'
 }
 stop_pid() {
   local pid=$1
@@ -201,6 +215,14 @@ export E2E_NODE_A_PID="$NODE_A_PID" E2E_NODE_B_PID="$NODE_B_PID"
 export E2E_NODE_A_RESTART_ENV="$TEMP_DIR/node-a2.env" E2E_NODE_B_RESTART_ENV="$TEMP_DIR/node-b2.env"
 export E2E_SERVER_BINARY="$TEMP_DIR/collab-server" E2E_PROJECT_ROOT="$ROOT" E2E_ETCD_CONTAINER="$ETCD_CONTAINER" E2E_RESTART_PID_FILE="$TEMP_DIR/restart-pids"
 export E2E_BROWSER_CHANNEL=chrome
+
+if [[ -n ${WEBTRANSPORT_LOAD_USERS:-} ]]; then
+  log "REAL CHROME WEBTRANSPORT CAPACITY ($WEBTRANSPORT_LOAD_USERS users): START"
+  (cd frontend && env REST_A="$REST_A" REST_B="$REST_B" WT_A="$WT_A" WT_B="$WT_B" VITE_A="$VITE_A" WT_HASH="$WT_HASH" \
+    WEBTRANSPORT_LOAD_USERS="$WEBTRANSPORT_LOAD_USERS" node "$ROOT/scripts/webtransport-capacity.mjs") 2>&1 | tee -a "$REPORT"
+  log 'REAL CHROME WEBTRANSPORT CAPACITY: PASS'
+  exit 0
+fi
 
 log 'REAL CHROME DISTRIBUTED WEBTRANSPORT: START'
 (cd frontend && npx playwright test e2e/distributed-webtransport.spec.ts --reporter=line) 2>&1 | tee -a "$REPORT"

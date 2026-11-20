@@ -76,6 +76,10 @@ type snapshotRetryEvent struct{}
 
 func (snapshotRetryEvent) isRoomEvent() {}
 
+type presenceEvent struct{}
+
+func (presenceEvent) isRoomEvent() {}
+
 type permissionEvent struct {
 	actorID string
 	userID  string
