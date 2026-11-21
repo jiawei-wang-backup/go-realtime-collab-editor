@@ -16,6 +16,30 @@ const documentCount = 20;
 const editCount = 30;
 const closeDeadline = timeout => new Promise(resolve => setTimeout(() => resolve(false), timeout));
 
+function integerSetting(name, fallback, minimum, maximum) {
+  const raw = process.env[name];
+  const value = raw === undefined ? fallback : Number(raw);
+  if (!Number.isInteger(value) || value < minimum || value > maximum) {
+    throw new Error(`${name} must be an integer from ${minimum} to ${maximum}`);
+  }
+  return value;
+}
+
+const connectConcurrency = integerSetting('WEBTRANSPORT_CONNECT_CONCURRENCY', 12, 1, 64);
+const connectIntervalMs = integerSetting('WEBTRANSPORT_CONNECT_INTERVAL_MS', 0, 0, 1000);
+const failoverMode = process.env.WEBTRANSPORT_FAILOVER_MODE === 'true';
+const failoverControlURL = process.env.FAILOVER_CONTROL_URL ? new URL(process.env.FAILOVER_CONTROL_URL) : null;
+const failoverControlToken = process.env.FAILOVER_CONTROL_TOKEN || '';
+const failoverTriggerMode = process.env.FAILOVER_TRIGGER_MODE || 'harness';
+const failoverOwnerIndex = integerSetting('FAILOVER_OWNER_INDEX', 0, 0, 1);
+const failoverSettleMs = integerSetting('FAILOVER_SETTLE_MS', 90000, 30000, 120000);
+if (failoverMode && (!failoverControlURL || !failoverControlToken)) {
+  throw new Error('WEBTRANSPORT_FAILOVER_MODE requires FAILOVER_CONTROL_URL and FAILOVER_CONTROL_TOKEN');
+}
+if (!['harness', 'external'].includes(failoverTriggerMode)) {
+  throw new Error('FAILOVER_TRIGGER_MODE must be harness or external');
+}
+
 function configuredURL(name, fallback, allowedProtocols) {
   const value = process.env[name] || fallback;
   const url = new URL(value);
@@ -39,7 +63,7 @@ const endpoints = [
 for (const url of endpoints) {
   if (url.pathname !== '/api/webtransport' || url.search) throw new Error('WebTransport URLs must use /api/webtransport');
 }
-const baseURL = configuredURL('CAPACITY_PAGE_URL', `http://127.0.0.1:${process.env.VITE_A}/auth`, ['http:', 'https:']);
+const baseURL = configuredURL('CAPACITY_PAGE_URL', `http://127.0.0.1:${process.env.VITE_A}/e2e/webtransport-capacity.html`, ['http:', 'https:']);
 if (baseURL.protocol === 'http:' && !['127.0.0.1', 'localhost', '[::1]'].includes(baseURL.hostname)) {
   throw new Error('the browser page must use HTTPS or a local secure context');
 }
@@ -67,6 +91,45 @@ async function request(baseURL, path, method, body, token) {
   return text ? JSON.parse(text) : {};
 }
 
+async function failoverControl(path, method = 'GET') {
+  if (!failoverMode || !failoverControlURL) return null;
+  const response = await fetch(new URL(path, failoverControlURL), {
+    method,
+    headers: { 'X-Failover-Token': failoverControlToken },
+    signal: AbortSignal.timeout(5000),
+  });
+  if (!response.ok) throw new Error(`failover control ${method} ${path} returned HTTP ${response.status}`);
+  return response.json();
+}
+
+function rendezvousScore(documentID, nodeID, incarnation) {
+  const parts = [documentID, nodeID, incarnation].map(value => {
+    const length = Buffer.alloc(4);
+    length.writeUInt32BE(Buffer.byteLength(value));
+    return Buffer.concat([length, Buffer.from(value)]);
+  });
+  return crypto.createHash('sha256').update(Buffer.concat(parts)).digest();
+}
+
+// Owner selection is rendezvous hashing over (document, node, incarnation). A
+// normal document set splits roughly evenly between nodes, so a single-node
+// failover drill must select documents that all rank the target node first.
+function ownerPreferredDocuments(count) {
+  const ownerNode = process.env.FAILOVER_OWNER_NODE_ID || 'node-a';
+  const ownerIncarnation = process.env.FAILOVER_OWNER_INCARNATION || 'process-a';
+  const peerNode = process.env.FAILOVER_PEER_NODE_ID || 'node-b';
+  const peerIncarnation = process.env.FAILOVER_PEER_INCARNATION || 'process-b';
+  const docs = [];
+  for (let index = 0; docs.length < count && index < count * 100; index++) {
+    const id = `wt${crypto.randomBytes(6).toString('hex')}${index}`;
+    const ownerScore = rendezvousScore(id, ownerNode, ownerIncarnation);
+    const peerScore = rendezvousScore(id, peerNode, peerIncarnation);
+    if (Buffer.compare(ownerScore, peerScore) >= 0) docs.push(id);
+  }
+  if (docs.length < count) throw new Error('could not generate owner-preferred document IDs');
+  return docs;
+}
+
 async function provisionUsers() {
   const password = crypto.randomBytes(20).toString('hex');
   const prefix = `b${Date.now().toString(36)}`;
@@ -88,7 +151,9 @@ async function provisionUsers() {
       users[index] = { i: index, id, token, doc };
     }
   }));
-  const docs = Array.from({ length: documentCount }, (_, index) => `wt${crypto.randomBytes(6).toString('hex')}${index}`);
+  const docs = failoverMode
+    ? ownerPreferredDocuments(documentCount)
+    : Array.from({ length: documentCount }, (_, index) => `wt${crypto.randomBytes(6).toString('hex')}${index}`);
   const permissionsStarted = performance.now();
   let permissionIndex = 0;
   for (const [index, doc] of docs.entries()) {
@@ -126,10 +191,29 @@ try {
   for (const server of servers) {
     browsers.push(await chromium.connect(server.wsEndpoint()));
   }
-  for (const browser of browsers) {
+  for (const [index, browser] of browsers.entries()) {
     const page = await browser.newPage();
     pages.push(page);
-    await page.goto(baseURL.href);
+    const navigationDiagnostics = [];
+    const recordNavigationDiagnostic = value => {
+      if (navigationDiagnostics.length < 5) navigationDiagnostics.push(value);
+    };
+    page.on('requestfailed', request => {
+      const url = new URL(request.url());
+      recordNavigationDiagnostic(`request_failed:${url.origin === baseURL.origin ? url.pathname : url.origin}:${request.failure()?.errorText ?? 'unknown'}`);
+    });
+    page.on('response', response => {
+      if (response.status() >= 400) {
+        const url = new URL(response.url());
+        recordNavigationDiagnostic(`http_${response.status()}:${url.origin === baseURL.origin ? url.pathname : url.origin}`);
+      }
+    });
+    try {
+      const response = await page.goto(baseURL.href, { waitUntil: 'domcontentloaded' });
+      if (!response?.ok()) throw new Error(`capacity page returned HTTP ${response?.status() ?? 'unknown'}`);
+    } catch (error) {
+      throw new Error(`phase=page_navigation page_index=${index} diagnostics=${JSON.stringify(navigationDiagnostics)}: ${String(error)}`);
+    }
   }
   for (const target of steps) {
     const previous = results.at(-1)?.target ?? 0;
@@ -137,21 +221,31 @@ try {
     const assignments = pages.map(() => []);
     for (const user of batch) assignments[user.i % pages.length].push(user);
     const start = performance.now();
-    const parts = await Promise.all(pages.map((page, index) => page.evaluate(async ({ group, docs, endpoints, hash }) => {
-      const state = globalThis.__wtCapacity ??= { sessions: [], closed: 0, connected: 0, acks: {}, lastVersion: 0 };
+    const parts = await Promise.all(pages.map((page, index) => page.evaluate(async ({ group, docs, endpoints, hash, connectConcurrency, connectIntervalMs, failoverMode, failoverOwnerIndex }) => {
+      const state = globalThis.__wtCapacity ??= { sessions: [], closed: 0, connected: 0, active: 0, disconnects: 0, reconnects: 0, reconnectFailures: 0, reconnectErrors: {}, reconnectLatencies: [], byEndpoint: {}, shuttingDown: false, failover: false, acks: {}, lastVersion: 0 };
+      state.failover = failoverMode;
       const digest = Uint8Array.from(atob(hash), character => character.charCodeAt(0));
       const options = { serverCertificateHashes: [{ algorithm: 'sha-256', value: digest }] };
       const encoder = new TextEncoder();
       const decoder = new TextDecoder();
       const timeout = (millis, reason) => new Promise((_, reject) => setTimeout(() => reject(new Error(reason)), millis));
-      const connect = async (user, endpoint, hops = 0) => {
+      let nextConnectAt = performance.now();
+      const paceConnection = async () => {
+        if (!connectIntervalMs) return;
+        const scheduledAt = nextConnectAt;
+        nextConnectAt += connectIntervalMs;
+        const wait = scheduledAt - performance.now();
+        if (wait > 0) await new Promise(resolve => setTimeout(resolve, wait));
+      };
+      const connect = async (user, endpoint, hops = 0, reconnecting = false) => {
         if (hops > 3) throw new Error('redirect limit');
+        await paceConnection();
         const started = performance.now();
         const session = new WebTransport(endpoint, options);
         let joined = false;
         try {
-          await Promise.race([session.ready, timeout(10000, 'WebTransport ready timeout')]);
-          const stream = await Promise.race([session.createBidirectionalStream(), timeout(10000, 'stream timeout')]);
+          await Promise.race([session.ready, timeout(reconnecting ? 4000 : 10000, 'WebTransport ready timeout')]);
+          const stream = await Promise.race([session.createBidirectionalStream(), timeout(reconnecting ? 4000 : 10000, 'stream timeout')]);
           const writer = stream.writable.getWriter();
           const reader = stream.readable.getReader();
           const send = message => {
@@ -187,36 +281,93 @@ try {
             } catch (error) { if (!joined) rejectOutcome(error); }
           })();
           await send({ type: 'auth', token: user.token });
-          const answer = await Promise.race([outcome, timeout(12000, 'join timeout')]);
+          const answer = await Promise.race([outcome, timeout(reconnecting ? 6000 : 12000, 'join timeout')]);
           if (answer.redirect) {
             session.close({ closeCode: 0, reason: 'redirect' });
             const next = new URL(answer.redirect);
             next.pathname = '/api/webtransport';
-            return connect(user, next.toString(), hops + 1);
+            if (reconnecting && next.href === endpoints[failoverOwnerIndex]) throw new Error('owner redirect target is unreachable');
+            return connect(user, next.toString(), hops + 1, reconnecting);
           }
           if (user.i === 0) state.editSender = send;
-          state.sessions.push({ session, reader, writer });
-          state.connected++;
-          void session.closed.then(() => { state.closed++; }, () => { state.closed++; });
+          const entry = { session, reader, writer, user, endpoint };
+          state.sessions.push(entry);
+          if (!reconnecting) state.connected++;
+          state.active++;
+          state.byEndpoint[endpoint] = (state.byEndpoint[endpoint] ?? 0) + 1;
+          if (reconnecting) state.reconnects++;
+          const handleClose = () => {
+            state.closed++;
+            state.active = Math.max(0, state.active - 1);
+            state.byEndpoint[endpoint] = Math.max(0, (state.byEndpoint[endpoint] ?? 0) - 1);
+            if (!state.failover || state.shuttingDown) return;
+            state.disconnects++;
+            enqueueReconnect(user, performance.now());
+          };
+          void session.closed.then(handleClose, handleClose);
           return { latency: performance.now() - started, hops };
         } catch (error) {
           try { session.close({ closeCode: 0, reason: 'setup failed' }); } catch { /* closed */ }
-          throw error;
+          const port = new URL(endpoint).port;
+          throw new Error(`hop=${hops} endpoint_port=${port}: ${String(error)}`);
         }
+      };
+      const initialEndpoint = user => failoverMode ? endpoints[0] : endpoints[user.i % 2];
+      const reconnectQueue = [];
+      let reconnectActive = 0;
+      const enqueueReconnect = (user, disconnectedAt) => {
+        reconnectQueue.push({ user, disconnectedAt });
+        pumpReconnects();
+      };
+      const pumpReconnects = () => {
+        if (state.shuttingDown) return;
+        while (reconnectActive < 8 && reconnectQueue.length) {
+          const job = reconnectQueue.shift();
+          reconnectActive++;
+          void (async () => {
+            try {
+              await new Promise(resolve => setTimeout(resolve, Math.random() * 300));
+              await reconnect(job.user);
+              state.reconnectLatencies.push(performance.now() - job.disconnectedAt);
+            } catch (error) {
+              state.reconnectFailures++;
+              const reason = String(error);
+              state.reconnectErrors[reason] = (state.reconnectErrors[reason] ?? 0) + 1;
+            } finally {
+              reconnectActive--;
+              pumpReconnects();
+            }
+          })();
+        }
+      };
+      const reconnect = async user => {
+        let lastError;
+        const peerEndpoint = endpoints[(failoverOwnerIndex + 1) % 2];
+        const ownerEndpoint = endpoints[failoverOwnerIndex];
+        for (let attempt = 0; attempt < 10; attempt++) {
+          for (const candidate of [peerEndpoint, ownerEndpoint]) {
+            if (state.shuttingDown) throw new Error('shutting down');
+            try { return await connect(user, candidate, 0, true); }
+            catch (error) { lastError = error; }
+          }
+          await new Promise(resolve => setTimeout(resolve, 400 + Math.min(1200, 200 * attempt)));
+        }
+        throw lastError ?? new Error('reconnect failed');
       };
       const success = [], failures = {}, initialFailures = {};
       let next = 0;
-      await Promise.all(Array.from({ length: 12 }, async () => {
+      const workers = Math.min(connectConcurrency, Math.max(group.length, 1));
+      await Promise.all(Array.from({ length: workers }, async () => {
         while (next < group.length) {
           const user = group[next++];
           const firstAttemptAt = performance.now();
-          try { success.push(await connect(user, endpoints[user.i % 2])); }
+          try { success.push(await connect(user, initialEndpoint(user))); }
           catch (error) {
             const key = String(error);
             initialFailures[key] = (initialFailures[key] ?? 0) + 1;
             if (key.includes('Connection lost') || key.includes('session is closed')) {
               try {
-                const recovered = await connect(user, endpoints[user.i % 2]);
+                const recovered = await connect(user, initialEndpoint(user));
                 success.push({ ...recovered, latency: performance.now() - firstAttemptAt });
               } catch (retryError) {
                 const retryKey = String(retryError);
@@ -229,19 +380,116 @@ try {
         }
       }));
       return { success, failures, initialFailures, total: state.connected, closed: state.closed };
-    }, { group: assignments[index], docs, endpoints: endpoints.map(url => url.href), hash })));
+    }, { group: assignments[index], docs, endpoints: endpoints.map(url => url.href), hash, connectConcurrency, connectIntervalMs, failoverMode, failoverOwnerIndex })));
     const times = parts.flatMap(part => part.success.map(item => item.latency)).sort((a, b) => a - b);
     const failures = {}, initialFailures = {}; for (const part of parts) { for (const [reason, count] of Object.entries(part.failures)) failures[reason] = (failures[reason] ?? 0) + count; for (const [reason, count] of Object.entries(part.initialFailures)) initialFailures[reason] = (initialFailures[reason] ?? 0) + count; }
     await new Promise(resolve => setTimeout(resolve, 1500));
     const snapshots = await Promise.all(pages.map(page => page.evaluate(() => ({ total: globalThis.__wtCapacity.connected, closed: globalThis.__wtCapacity.closed }))));
     const total = snapshots.reduce((sum, part) => sum + part.total, 0);
     const closed = snapshots.reduce((sum, part) => sum + part.closed, 0);
-    const result = { target, total, closed, newSuccess: times.length, initialFailures, failures,
+    const result = { target, total, closed, newSuccess: times.length, connectConcurrency, connectIntervalMs, initialFailures, failures,
       p95Ms: times.length ? Math.round(times[Math.ceil(times.length * 0.95) - 1]) : null,
       elapsedMs: Math.round(performance.now() - start) };
     results.push(result);
     console.log(JSON.stringify(result));
-    if (Object.keys(failures).length || total !== target || closed) { status = 1; break; }
+    if (Object.keys(initialFailures).length || Object.keys(failures).length || total !== target || closed) { status = 1; break; }
+  }
+  let editVersionBase = 0;
+  if (!status && failoverMode) {
+    const readyStates = await Promise.all(pages.map(page => page.evaluate(() => ({ version: globalThis.__wtCapacity.lastVersion, active: globalThis.__wtCapacity.active, byEndpoint: globalThis.__wtCapacity.byEndpoint }))));
+    const before = {
+      version: readyStates[0]?.version ?? 0,
+      active: readyStates.reduce((sum, item) => sum + item.active, 0),
+      byEndpoint: readyStates.reduce((merged, item) => {
+        for (const [endpoint, count] of Object.entries(item.byEndpoint ?? {})) merged[endpoint] = (merged[endpoint] ?? 0) + count;
+        return merged;
+      }, {}),
+    };
+    if (before.active !== userCount) throw new Error(`READY requires ${userCount} active sessions, got ${before.active}`);
+    const ownerEndpoint = endpoints[0].href;
+    const ownerSessions = before.byEndpoint[ownerEndpoint] ?? 0;
+    if (ownerSessions !== userCount) throw new Error(`READY requires ${userCount} owner sessions, got ${ownerSessions}`);
+    const ready = await failoverControl('/ready', 'POST');
+    console.log(JSON.stringify({ failover: 'READY', version: before.version, active: before.active, ownerEndpoint, ownerSessions, byEndpoint: before.byEndpoint, ready }));
+    if (failoverTriggerMode === 'harness') {
+      await new Promise(resolve => setTimeout(resolve, 3000));
+      const triggeredByHarness = await failoverControl('/trigger', 'POST');
+      console.log(JSON.stringify({ failover: 'TRIGGER', source: 'harness', state: triggeredByHarness }));
+    } else {
+      const triggerDeadline = Date.now() + 300000;
+      let triggered = false;
+      while (Date.now() < triggerDeadline) {
+        const controlState = await failoverControl('/state');
+        if (controlState?.triggered) { triggered = true; break; }
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
+      if (!triggered) throw new Error('failover trigger timeout');
+      console.log(JSON.stringify({ failover: 'TRIGGER', source: 'external' }));
+    }
+    const recoveryStarted = Date.now();
+    let observedDisconnect = false;
+    let stableSince = 0;
+    let lastCounts = '';
+    while (Date.now() - recoveryStarted < 180000) {
+      const snapshots = await Promise.all(pages.map(page => page.evaluate(() => ({
+        active: globalThis.__wtCapacity.active,
+        disconnects: globalThis.__wtCapacity.disconnects,
+        reconnects: globalThis.__wtCapacity.reconnects,
+        reconnectFailures: globalThis.__wtCapacity.reconnectFailures,
+      }))));
+      const active = snapshots.reduce((sum, item) => sum + item.active, 0);
+      const disconnects = snapshots.reduce((sum, item) => sum + item.disconnects, 0);
+      const reconnects = snapshots.reduce((sum, item) => sum + item.reconnects, 0);
+      const reconnectFailures = snapshots.reduce((sum, item) => sum + item.reconnectFailures, 0);
+      if (disconnects > 0) observedDisconnect = true;
+      const settled = Date.now() - recoveryStarted >= failoverSettleMs;
+      const recovered = settled && observedDisconnect && active === userCount && reconnectFailures === 0 && reconnects >= 1 && reconnects === disconnects;
+      const counts = `${active}/${disconnects}/${reconnects}/${reconnectFailures}`;
+      if (recovered && counts === lastCounts) {
+        if (Date.now() - stableSince >= 5000) break;
+      } else {
+        stableSince = Date.now();
+        lastCounts = counts;
+      }
+      await new Promise(resolve => setTimeout(resolve, 500));
+    }
+    if (!observedDisconnect) throw new Error('failover did not disconnect any session');
+    const recovery = await Promise.all(pages.map(page => page.evaluate(() => ({
+      active: globalThis.__wtCapacity.active,
+      disconnects: globalThis.__wtCapacity.disconnects,
+      reconnects: globalThis.__wtCapacity.reconnects,
+      reconnectFailures: globalThis.__wtCapacity.reconnectFailures,
+      reconnectLatencies: globalThis.__wtCapacity.reconnectLatencies,
+      reconnectErrors: globalThis.__wtCapacity.reconnectErrors,
+      version: globalThis.__wtCapacity.lastVersion,
+    }))));
+    const active = recovery.reduce((sum, item) => sum + item.active, 0);
+    const disconnects = recovery.reduce((sum, item) => sum + item.disconnects, 0);
+    const reconnects = recovery.reduce((sum, item) => sum + item.reconnects, 0);
+    const reconnectFailures = recovery.reduce((sum, item) => sum + item.reconnectFailures, 0);
+    const latency = recovery.flatMap(item => item.reconnectLatencies).sort((a, b) => a - b);
+    const reconnectErrors = {}; for (const item of recovery) for (const [reason, count] of Object.entries(item.reconnectErrors ?? {})) reconnectErrors[reason] = (reconnectErrors[reason] ?? 0) + count;
+    const percentile = value => Math.round(latency[Math.min(latency.length - 1, Math.ceil(latency.length * value) - 1)] ?? 0);
+    editVersionBase = recovery[0].version;
+    const summary = {
+      failover: 'RECOVERY',
+      active,
+      disconnects,
+      reconnects,
+      reconnectFailures,
+      reconnectErrors,
+      reconnectP50Ms: percentile(0.5),
+      reconnectP95Ms: percentile(0.95),
+      reconnectP99Ms: percentile(0.99),
+      preFailoverVersion: before.version,
+      recoveryVersion: editVersionBase,
+      online: recovery.map(item => ({ active: item.active, disconnects: item.disconnects, reconnects: item.reconnects, reconnectFailures: item.reconnectFailures })),
+    };
+    console.log(JSON.stringify(summary));
+    if (active !== userCount) status = 1;
+    if (disconnects === 0 || reconnects === 0) status = 1;
+    if (reconnectFailures) status = 1;
+    if (editVersionBase < before.version) status = 1;
   }
   if (!status) {
     const editLatency = [];
@@ -260,11 +508,15 @@ try {
       }, { requestId, docID: docs[0] });
       editLatency.push(result.ms);
       if ((index + 1) % 10 === 0) {
-        const totals = await Promise.all(pages.map(page => page.evaluate(() => ({ total: globalThis.__wtCapacity.connected, closed: globalThis.__wtCapacity.closed }))));
-        const observation = { edits: index + 1, total: totals.reduce((n, item) => n + item.total, 0), closed: totals.reduce((n, item) => n + item.closed, 0), version: result.version };
+        const totals = await Promise.all(pages.map(page => page.evaluate(() => ({ total: globalThis.__wtCapacity.connected, active: globalThis.__wtCapacity.active, closed: globalThis.__wtCapacity.closed }))));
+        const onlineCount = totals.reduce((n, item) => n + (failoverMode ? item.active : item.total), 0);
+        const observation = { edits: index + 1, total: onlineCount, closed: totals.reduce((n, item) => n + item.closed, 0), version: result.version };
         online.push(observation);
         console.log(JSON.stringify(observation));
-        if (observation.closed || observation.total !== userCount || observation.version !== index + 1) { status = 1; break; }
+        const invalidOnline = failoverMode
+          ? onlineCount !== userCount
+          : observation.closed || onlineCount !== userCount;
+        if (invalidOnline || observation.version !== editVersionBase + index + 1) { status = 1; break; }
       }
       await new Promise(resolve => setTimeout(resolve, Math.max(0, 1000 - (performance.now() - cycle))));
     }
@@ -280,6 +532,7 @@ try {
 } finally {
   const sessionCloseRequests = await Promise.race([
     Promise.all(pages.map(page => page.evaluate(async () => {
+      if (globalThis.__wtCapacity) globalThis.__wtCapacity.shuttingDown = true;
       const sessions = globalThis.__wtCapacity?.sessions ?? [];
       for (let index = 0; index < sessions.length; index += 20) {
         for (const { session, reader, writer } of sessions.slice(index, index + 20)) {
