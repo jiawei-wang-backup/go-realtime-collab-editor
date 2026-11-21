@@ -26,6 +26,11 @@ type MessageConn interface {
 	CloseNow() error
 }
 
+// redirectDrainer lets a transport finish delivering a redirect before closing the session.
+type redirectDrainer interface {
+	DrainRedirect(time.Duration) error
+}
+
 type Config struct {
 	Manager            *room.Manager
 	Authenticator      authentication.Authenticator
@@ -77,6 +82,7 @@ type sessionClient struct {
 	pendingCursors     map[string]pendingCursor
 	closed             bool
 	joined             bool
+	redirected         bool
 	cursorWindow       time.Time
 	cursorMessages     int
 }
@@ -198,13 +204,32 @@ func (client *sessionClient) run(parent context.Context) {
 // immediate path used for revocation, slow clients, and transport failures.
 func (client *sessionClient) finish() {
 	client.mu.Lock()
-	if !client.closed {
+	alreadyClosed := client.closed
+	if !alreadyClosed {
 		client.closed = true
 		close(client.send)
 	}
 	client.mu.Unlock()
 	<-client.writeDone
-	_ = client.connection.CloseNow()
+	if client.redirected && !alreadyClosed {
+		if drainer, ok := client.connection.(redirectDrainer); ok {
+			if err := drainer.DrainRedirect(client.config.WriteTimeout); err != nil {
+				slog.Debug("browser redirect transport shutdown failed",
+					"component", "browser_transport",
+					"event", "redirect_shutdown_failed",
+					"error", err,
+				)
+			}
+			return
+		}
+	}
+	if err := client.connection.CloseNow(); err != nil {
+		slog.Debug("browser transport shutdown failed",
+			"component", "browser_transport",
+			"event", "transport_shutdown_failed",
+			"error", err,
+		)
+	}
 }
 
 func (client *sessionClient) authenticate(parent context.Context) bool {
@@ -275,9 +300,7 @@ func (client *sessionClient) selectDocument(ctx context.Context, message protoco
 			return false
 		}
 		// A cold document has a preferred node before it has an active owner.
-		switch owner.State {
-		case cluster.OwnerAcquiring, cluster.OwnerRecovering, cluster.OwnerActive:
-		default:
+		if !routableOwner(owner) {
 			client.sendError(protocol.CodeServiceUnavailable, "document owner is unavailable")
 			return false
 		}
@@ -287,6 +310,15 @@ func (client *sessionClient) selectDocument(ctx context.Context, message protoco
 	}
 	target, err := client.config.Manager.RoomContext(ctx, message.DocID)
 	if err != nil {
+		// Ownership can move after the initial resolution while an idle Room is
+		// releasing its lease. Resolve once more so the client follows the new
+		// owner instead of treating that handoff as an unavailable document.
+		if resolver != nil {
+			owner, resolveErr := resolver.EnsureOwner(ctx, message.DocID)
+			if resolveErr == nil && routableOwner(owner) && !client.isLocalOwner(owner) {
+				return client.redirectToOwner(ctx, message.DocID, owner)
+			}
+		}
 		client.sendRoomError(err, "could not open document")
 		return false
 	}
@@ -315,6 +347,15 @@ func (client *sessionClient) isLocalOwner(owner cluster.Owner) bool {
 	return owner.NodeID == client.config.LocalNode.NodeID && owner.Incarnation == client.config.LocalNode.Incarnation
 }
 
+func routableOwner(owner cluster.Owner) bool {
+	switch owner.State {
+	case cluster.OwnerAcquiring, cluster.OwnerRecovering, cluster.OwnerActive:
+		return true
+	default:
+		return false
+	}
+}
+
 func (client *sessionClient) redirectToOwner(ctx context.Context, docID string, owner cluster.Owner) bool {
 	if client.config.NodeDirectory == nil {
 		client.sendError(protocol.CodeServiceUnavailable, "document owner is unavailable")
@@ -339,7 +380,9 @@ func (client *sessionClient) redirectToOwner(ctx context.Context, docID string, 
 	cancel()
 	if err != nil {
 		client.Close(err)
+		return false
 	}
+	client.redirected = true
 	return false
 }
 

@@ -221,6 +221,21 @@ func (connection *streamConnection) Write(ctx context.Context, message protocol.
 	return nil
 }
 
+// DrainRedirect sends stream EOF after the redirect and lets the peer close
+// the session. An unresponsive peer is disconnected within the write budget.
+func (connection *streamConnection) DrainRedirect(timeout time.Duration) error {
+	if err := connection.stream.Close(); err != nil {
+		return errors.Join(err, connection.CloseNow())
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-connection.session.Context().Done():
+	case <-timer.C:
+	}
+	return connection.CloseNow()
+}
+
 func (connection *streamConnection) CloseNow() error {
 	var err error
 	connection.closeOnce.Do(func() {

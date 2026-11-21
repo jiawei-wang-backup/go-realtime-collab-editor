@@ -114,6 +114,96 @@ func (r changingOwner) Resolve(context.Context, string) (cluster.Owner, error) {
 	return r.resolved, r.err
 }
 
+type handoffOwner struct {
+	mu     sync.Mutex
+	local  cluster.Owner
+	remote cluster.Node
+	calls  int
+}
+
+var (
+	_ cluster.OwnershipService = (*handoffOwner)(nil)
+	_ cluster.NodeDirectory    = (*handoffOwner)(nil)
+)
+
+func (owner *handoffOwner) EnsureOwner(context.Context, string) (cluster.Owner, error) {
+	owner.mu.Lock()
+	defer owner.mu.Unlock()
+	owner.calls++
+	if owner.calls == 1 {
+		return owner.local, nil
+	}
+	return cluster.Owner{
+		NodeID: owner.remote.NodeID, Incarnation: owner.remote.Incarnation, State: cluster.OwnerActive,
+	}, nil
+}
+
+func (owner *handoffOwner) Resolve(ctx context.Context, documentID string) (cluster.Owner, error) {
+	return owner.EnsureOwner(ctx, documentID)
+}
+
+func (*handoffOwner) Acquire(context.Context, string) (*cluster.OwnershipHandle, error) {
+	return nil, cluster.ErrNotPreferredNode
+}
+
+func (*handoffOwner) BeginRecovery(context.Context, *cluster.OwnershipHandle) error { return nil }
+func (*handoffOwner) Activate(context.Context, *cluster.OwnershipHandle) error      { return nil }
+func (*handoffOwner) BeginDraining(context.Context, *cluster.OwnershipHandle) error { return nil }
+func (*handoffOwner) Release(context.Context, *cluster.OwnershipHandle) error       { return nil }
+
+func (owner *handoffOwner) Lookup(nodeID, incarnation string) (cluster.Node, bool) {
+	return owner.remote, nodeID == owner.remote.NodeID && incarnation == owner.remote.Incarnation
+}
+
+func TestJoinRedirectsWhenOwnershipMovesDuringColdRecovery(t *testing.T) {
+	ctx := context.Background()
+	store := memory.NewMemory()
+	if _, err := store.CreateDocument(ctx, "doc", "private", "alice"); err != nil {
+		t.Fatal(err)
+	}
+	local := cluster.Node{NodeID: "node-a", Incarnation: "process-a"}
+	owner := &handoffOwner{
+		local: cluster.Owner{
+			NodeID: local.NodeID, Incarnation: local.Incarnation, State: cluster.OwnerActive,
+		},
+		remote: cluster.Node{
+			NodeID: "node-b", Incarnation: "process-b", Status: cluster.NodeReady,
+			BrowserEndpoint: "https://node-b.example.com",
+		},
+	}
+	manager := room.NewManager(store, room.WithOwnership(owner))
+	t.Cleanup(func() {
+		if err := manager.Shutdown(ctx); err != nil {
+			t.Error(err)
+		}
+	})
+	connection := &recordingMessageConn{}
+	client := sessionClient{
+		connection: connection,
+		config: Config{
+			Manager: manager, LocalNode: local, OwnerResolver: owner, NodeDirectory: owner,
+			WriteTimeout: time.Second,
+		},
+		send: make(chan protocol.Message, 1),
+	}
+
+	if client.selectDocument(ctx, protocol.Message{Type: protocol.TypeJoin, DocID: "doc"}) {
+		t.Fatal("selection continued after redirect")
+	}
+	if client.joined || client.room != nil {
+		t.Fatal("client joined the stale local Room")
+	}
+	if !client.redirected {
+		t.Fatal("ownership handoff did not mark the session as redirected")
+	}
+	connection.mu.Lock()
+	defer connection.mu.Unlock()
+	if len(connection.messages) != 1 || connection.messages[0].Type != protocol.TypeOwnerRedirect ||
+		connection.messages[0].Endpoint != owner.remote.BrowserEndpoint {
+		t.Fatalf("redirect response = %#v", connection.messages)
+	}
+}
+
 func TestColdRoomRequiresActiveLocalOwnerAfterRecovery(t *testing.T) {
 	ctx := context.Background()
 	store := memory.NewMemory()
