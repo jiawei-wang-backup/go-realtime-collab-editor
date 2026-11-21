@@ -408,6 +408,8 @@ if [[ "${FIXTURE_ONLY:-false}" == true ]]; then
   log "CAPACITY_PAGE_URL=$VITE_SCHEME://127.0.0.1:$VITE_A/e2e/webtransport-capacity.html"
   log "WT_CA_FILE=$TEMP_DIR/webtransport.pem"
   log "WT_ORIGIN=$VITE_SCHEME://127.0.0.1:$VITE_A"
+  log "ADMIN_A_URL=http://127.0.0.1:$ADMIN_A"
+  log "ADMIN_B_URL=http://127.0.0.1:$ADMIN_B"
   log "NODE_A_PID=$NODE_A_PID"
   log "NODE_B_PID=$NODE_B_PID"
   log 'Press Ctrl+C after the external load client finishes.'

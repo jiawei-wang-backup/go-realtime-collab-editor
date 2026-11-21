@@ -46,26 +46,30 @@ type config struct {
 }
 
 type report struct {
-	Clients                       int            `json:"clients"`
-	Documents                     int            `json:"documents"`
-	PreparationSeconds            float64        `json:"preparation_seconds"`
-	JoinSuccess                   int64          `json:"join_success"`
-	JoinFailures                  int64          `json:"join_failures"`
-	JoinErrorSamples              map[string]int `json:"join_error_samples,omitempty"`
-	Redirects                     int64          `json:"redirects"`
-	Edits                         int64          `json:"edits"`
-	EditFailures                  int64          `json:"edit_failures"`
-	RemoteUpdates                 int64          `json:"remote_updates"`
-	MaxObservedVersion            uint64         `json:"max_observed_version"`
-	UnexpectedDisconnects         int64          `json:"unexpected_disconnects"`
-	LogicalSessions               int            `json:"logical_sessions"`
-	TransportInstances            int            `json:"transport_instances"`
-	UnderlyingConnectionsMeasured bool           `json:"underlying_connections_measured"`
-	JoinP50Ms                     float64        `json:"join_p50_ms"`
-	JoinP95Ms                     float64        `json:"join_p95_ms"`
-	EditAckP50Ms                  float64        `json:"edit_ack_p50_ms"`
-	EditAckP95Ms                  float64        `json:"edit_ack_p95_ms"`
-	ElapsedSeconds                float64        `json:"elapsed_seconds"`
+	Clients                       int               `json:"clients"`
+	Documents                     int               `json:"documents"`
+	PreparationSeconds            float64           `json:"preparation_seconds"`
+	JoinSuccess                   int64             `json:"join_success"`
+	JoinFailures                  int64             `json:"join_failures"`
+	JoinErrorSamples              map[string]int    `json:"join_error_samples,omitempty"`
+	Redirects                     int64             `json:"redirects"`
+	Edits                         int64             `json:"edits"`
+	EditFailures                  int64             `json:"edit_failures"`
+	RemoteUpdates                 int64             `json:"remote_updates"`
+	MaxObservedVersion            uint64            `json:"max_observed_version"`
+	ConvergenceOK                 bool              `json:"convergence_ok"`
+	ConvergenceErrors             []string          `json:"convergence_errors,omitempty"`
+	FinalVersions                 map[string]uint64 `json:"final_versions,omitempty"`
+	FinalContents                 map[string]string `json:"final_contents,omitempty"`
+	UnexpectedDisconnects         int64             `json:"unexpected_disconnects"`
+	LogicalSessions               int               `json:"logical_sessions"`
+	TransportInstances            int               `json:"transport_instances"`
+	UnderlyingConnectionsMeasured bool              `json:"underlying_connections_measured"`
+	JoinP50Ms                     float64           `json:"join_p50_ms"`
+	JoinP95Ms                     float64           `json:"join_p95_ms"`
+	EditAckP50Ms                  float64           `json:"edit_ack_p50_ms"`
+	EditAckP95Ms                  float64           `json:"edit_ack_p95_ms"`
+	ElapsedSeconds                float64           `json:"elapsed_seconds"`
 }
 
 type session struct {
@@ -81,6 +85,66 @@ type session struct {
 }
 
 type pendingAck struct{ done chan struct{} }
+
+type convergenceTracker struct {
+	mu         sync.Mutex
+	operations map[string]map[uint64]collab.Operation
+}
+
+func newConvergenceTracker(documents []string) *convergenceTracker {
+	operations := make(map[string]map[uint64]collab.Operation, len(documents))
+	for _, documentID := range documents {
+		operations[documentID] = make(map[uint64]collab.Operation)
+	}
+	return &convergenceTracker{operations: operations}
+}
+
+func (tracker *convergenceTracker) record(message protocol.Message) {
+	if message.Type != protocol.TypeEditApplied || message.Operation == nil {
+		return
+	}
+	tracker.mu.Lock()
+	defer tracker.mu.Unlock()
+	byVersion, ok := tracker.operations[message.DocID]
+	if !ok {
+		byVersion = make(map[uint64]collab.Operation)
+		tracker.operations[message.DocID] = byVersion
+	}
+	if _, exists := byVersion[message.Version]; !exists {
+		byVersion[message.Version] = *message.Operation
+	}
+}
+
+func (tracker *convergenceTracker) snapshot() (bool, map[string]uint64, map[string]string, []string) {
+	tracker.mu.Lock()
+	defer tracker.mu.Unlock()
+	versions := make(map[string]uint64, len(tracker.operations))
+	contents := make(map[string]string, len(tracker.operations))
+	var problems []string
+	for documentID, byVersion := range tracker.operations {
+		content := ""
+		var version uint64
+		for next := uint64(1); ; next++ {
+			op, ok := byVersion[next]
+			if !ok {
+				break
+			}
+			var err error
+			content, err = collab.Apply(content, op)
+			if err != nil {
+				problems = append(problems, fmt.Sprintf("%s version %d: %v", documentID, next, err))
+				break
+			}
+			version = next
+		}
+		versions[documentID] = version
+		contents[documentID] = content
+		if version != uint64(len(byVersion)) {
+			problems = append(problems, fmt.Sprintf("%s has non-contiguous versions: applied=%d observed=%d", documentID, len(byVersion), version))
+		}
+	}
+	return len(problems) == 0, versions, contents, problems
+}
 
 func main() {
 	if err := run(); err != nil {
@@ -129,6 +193,7 @@ func run() error {
 	joinErrorSamples := make(map[string]int)
 	var joins, joinFailures, redirects, edits, editFailures, remoteUpdates, disconnects atomic.Int64
 	var maxObservedVersion atomic.Uint64
+	tracker := newConvergenceTracker(docs)
 	sessions := make([]*session, 0, cfg.clients)
 	for i := range users {
 		started := time.Now()
@@ -148,7 +213,7 @@ func run() error {
 		joins.Add(1)
 		redirects.Add(int64(count))
 		sessions = append(sessions, current)
-		go current.receive(&disconnects, &remoteUpdates, &maxObservedVersion)
+		go current.receive(&disconnects, &remoteUpdates, &maxObservedVersion, tracker)
 		if cfg.ramp > 0 && i+1 < cfg.clients {
 			timer := time.NewTimer(cfg.ramp / time.Duration(cfg.clients))
 			select {
@@ -175,7 +240,12 @@ func run() error {
 			closeSessions(sessions)
 			return ctx.Err()
 		case <-deadline.C:
+			convergenceOK, finalVersions, finalContents, convergenceErrors := tracker.snapshot()
 			closeSessions(sessions)
+			report.ConvergenceOK = convergenceOK
+			report.ConvergenceErrors = convergenceErrors
+			report.FinalVersions = finalVersions
+			report.FinalContents = finalContents
 			report.JoinP50Ms, report.JoinP95Ms = percentiles(joinLatencies)
 			report.EditAckP50Ms, report.EditAckP95Ms = percentiles(editLatencies)
 			report.Edits = edits.Load()
@@ -245,6 +315,10 @@ func parseConfig() (config, error) {
 	}
 	if cfg.clients < 1 || cfg.documents < 1 || cfg.ramp < 0 || cfg.online <= 0 || cfg.editCount < 0 || cfg.editInterval < 0 {
 		return cfg, errors.New("invalid load configuration")
+	}
+	maxUsername := fmt.Sprintf("%s-user-%d-%s", cfg.prefix, cfg.clients-1, "000000000000")
+	if len(maxUsername) > 32 {
+		return cfg, fmt.Errorf("prefix produces usernames longer than 32 characters; shorten prefix")
 	}
 	for _, endpoint := range splitCSV(*endpoints) {
 		normalized, err := normalizeEndpoint(endpoint)
@@ -350,7 +424,7 @@ func connect(ctx context.Context, cfg config, token, docID string) (*session, in
 	return nil, len(cfg.endpoints) + 1, errors.New("too many owner redirects")
 }
 
-func (s *session) receive(disconnects, remoteUpdates *atomic.Int64, maxObservedVersion *atomic.Uint64) {
+func (s *session) receive(disconnects, remoteUpdates *atomic.Int64, maxObservedVersion *atomic.Uint64, tracker *convergenceTracker) {
 	defer close(s.done)
 	for {
 		message, err := s.read()
@@ -362,6 +436,7 @@ func (s *session) receive(disconnects, remoteUpdates *atomic.Int64, maxObservedV
 			return
 		}
 		if message.Type == protocol.TypeEditApplied {
+			tracker.record(message)
 			s.version.Store(message.Version)
 			for {
 				observed := maxObservedVersion.Load()

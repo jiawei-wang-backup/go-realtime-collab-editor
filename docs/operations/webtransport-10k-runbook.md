@@ -26,6 +26,16 @@
 
 这两轮只证明协议冒烟和小规模基线，不代表 1,000/5,000/10,000 容量通过。
 
+Mac 本地轻量客户端基线：
+
+- 256 会话、20 文档：JOIN 256/256，Redirect 166，编辑 256/256，内容/版本收敛通过，意外断线 0；JOIN P95 83.784ms，编辑 ACK P95 59.5ms。准备阶段 76.14s，在线阶段 30.04s。
+- 256 会话指标复跑：JOIN 256/256，Redirect 114，编辑 256/256，内容/版本收敛通过，意外断线 0；JOIN P95 142.855ms，编辑 ACK P95 118.831ms。`collab_webtransport_sessions_active` 两节点峰值分别为 142 和 114，Room 事件队列深度峰值 0，etcd lease renewal failures 为 0。
+- 1,000 会话、100 文档：JOIN 1,000/1,000，Redirect 500，编辑 1,000/1,000，内容/版本收敛通过，意外断线 0；JOIN P95 151.322ms，编辑 ACK P95 137.094ms。准备阶段 360.92s，在线阶段 57.20s。
+- 1,000 会话采样峰值：两节点各观察到 500 活跃 Room 客户端、50 个 Room；Room 事件队列深度峰值 0，etcd lease renewal failures 为 0；单节点 goroutine 峰值约 6,710，堆峰值约 68.1MiB，服务进程 RSS 峰值约 140.5MiB，CPU 峰值约 78.3%。
+- 现有 `collab_quic_connections_active` 只覆盖原生 QUIC 客户端，不能代表 WebTransport 会话；已补充 `collab_webtransport_sessions_active`，下一轮采样使用该指标。轻量客户端报告也明确标记底层物理连接数未独立测量。
+
+当前首个可复现瓶颈是测试准备阶段：1,000 个账号/权限串行准备耗时约 361 秒；在线 JOIN/编辑阶段本身未出现队列堆积、租约失败或意外断线。该瓶颈属于测试设施准备路径，不据此修改 Room。
+
 当前尚未声称覆盖：
 
 - RESUME/SYNC/RESYNC 的完整断线恢复状态机；

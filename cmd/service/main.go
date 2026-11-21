@@ -122,7 +122,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	webTransportServer, err := listenWebTransport(runtimeConfig, application, authenticator, authService, ownership, directory)
+	webTransportServer, err := listenWebTransport(runtimeConfig, application, authenticator, authService, ownership, directory, metrics)
 	if err != nil {
 		return errors.Join(err, quicServer.Close(context.Background()), shutdownUnstarted(listener, application))
 	}
@@ -456,7 +456,7 @@ type webTransportLifecycle interface {
 	Addr() net.Addr
 }
 
-func listenWebTransport(runtimeConfig config.Config, application *api.Server, authenticator authentication.Authenticator, authService *authentication.Service, ownership cluster.OwnerResolver, directory cluster.NodeDirectory) (webTransportLifecycle, error) {
+func listenWebTransport(runtimeConfig config.Config, application *api.Server, authenticator authentication.Authenticator, authService *authentication.Service, ownership cluster.OwnerResolver, directory cluster.NodeDirectory, metrics *observability.Metrics) (webTransportLifecycle, error) {
 	if !runtimeConfig.WebTransport.Enabled {
 		return nil, nil
 	}
@@ -477,6 +477,7 @@ func listenWebTransport(runtimeConfig config.Config, application *api.Server, au
 		AllowedOrigins: runtimeConfig.Security.AllowedOrigins,
 		StreamTimeout:  runtimeConfig.WebTransport.StreamTimeout, IdleTimeout: runtimeConfig.WebTransport.IdleTimeout,
 		MaxMessageSize: uint32(runtimeConfig.WebTransport.MaxMessageSize),
+		Observer:       metrics,
 		Session:        browsertransportConfig(runtimeConfig, application, authenticator, registry, ownership, directory),
 	})
 	if err != nil {
