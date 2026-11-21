@@ -10,6 +10,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"io"
 	"math/big"
 	"net"
@@ -21,6 +22,7 @@ import (
 	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/app/authentication"
 	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/app/room"
 	identity "github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/domain/authentication"
+	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/domain/cluster"
 	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/domain/collab"
 	"github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/protocol"
 	browsertransport "github.com/jiawei-wang-dev/go-realtime-collab-editor/internal/transport/browser"
@@ -37,6 +39,129 @@ func (integrationAuthenticator) AuthenticateHTTP(*http.Request) (identity.Princi
 }
 func (integrationAuthenticator) ValidatePrincipal(context.Context, identity.Principal) error {
 	return nil
+}
+
+type integrationRemoteOwner struct{ node cluster.Node }
+
+var (
+	_ cluster.OwnerResolver = integrationRemoteOwner{}
+	_ cluster.NodeDirectory = integrationRemoteOwner{}
+)
+
+func (owner integrationRemoteOwner) Resolve(context.Context, string) (cluster.Owner, error) {
+	return cluster.Owner{NodeID: owner.node.NodeID, Incarnation: owner.node.Incarnation, State: cluster.OwnerActive}, nil
+}
+
+func (owner integrationRemoteOwner) EnsureOwner(ctx context.Context, docID string) (cluster.Owner, error) {
+	return owner.Resolve(ctx, docID)
+}
+
+func (owner integrationRemoteOwner) Lookup(nodeID, incarnation string) (cluster.Node, bool) {
+	return owner.node, nodeID == owner.node.NodeID && incarnation == owner.node.Incarnation
+}
+
+func TestRealWebTransportDrainsOwnerRedirect(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 6*time.Second)
+	defer cancel()
+	manager := room.NewManager(memory.NewMemory())
+	t.Cleanup(func() {
+		if err := manager.Shutdown(context.Background()); err != nil {
+			t.Error(err)
+		}
+	})
+	owner := integrationRemoteOwner{node: cluster.Node{
+		NodeID: "remote", Incarnation: "remote-1", Status: cluster.NodeReady,
+		BrowserEndpoint: "https://owner.example.com",
+	}}
+	tlsConfig := integrationServerTLS(t)
+	cert, err := x509.ParseCertificate(tlsConfig.Certificates[0].Certificate[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	roots := x509.NewCertPool()
+	roots.AddCert(cert)
+	const origin = "https://editor.example.com"
+	const writeTimeout = time.Second
+	server, err := Listen(Config{
+		Address: "127.0.0.1:0", TLSConfig: tlsConfig,
+		AllowedOrigins: []string{origin}, StreamTimeout: time.Second,
+		IdleTimeout: 5 * time.Second, MaxMessageSize: 1 << 20,
+		Session: browsertransport.Config{
+			Manager: manager, Authenticator: integrationAuthenticator{},
+			AuthTimeout: time.Second, OperationTimeout: time.Second, WriteTimeout: writeTimeout, SendQueueSize: 8,
+			OwnerResolver: owner, NodeDirectory: owner,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve(ctx) }()
+	t.Cleanup(func() {
+		if err := server.Close(context.Background()); err != nil && !errors.Is(err, net.ErrClosed) {
+			t.Error(err)
+		}
+		if err := <-serveDone; err != nil {
+			t.Error(err)
+		}
+	})
+	dialer := &webtransportgo.Transport{TLSClientConfig: &tls.Config{RootCAs: roots}}
+	t.Cleanup(func() {
+		if err := dialer.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	for _, tt := range []struct {
+		name       string
+		peerCloses bool
+	}{
+		{name: "peer closes after reading", peerCloses: true},
+		{name: "server reclaims unresponsive peer"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			_, session, err := dialer.Dial(ctx, "https://"+server.Addr().String()+Path, http.Header{"Origin": []string{origin}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			stream, err := session.OpenStreamSync(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			deadline, _ := ctx.Deadline()
+			if err := stream.SetDeadline(deadline); err != nil {
+				t.Fatal(err)
+			}
+			writeTestMessage(t, stream, protocol.Message{Type: protocol.TypeAuth, Token: "access"})
+			if msg := readTestMessage(t, stream); msg.Type != protocol.TypeAuthOK {
+				t.Fatalf("auth response = %q", msg.Type)
+			}
+			joinStarted := time.Now()
+			writeTestMessage(t, stream, protocol.Message{Type: protocol.TypeJoin, DocID: "doc"})
+			if msg := readTestMessage(t, stream); msg.Type != protocol.TypeOwnerRedirect || msg.Endpoint != owner.node.BrowserEndpoint {
+				t.Fatalf("redirect response = %#v", msg)
+			}
+			var extra [1]byte
+			if _, err := stream.Read(extra[:]); !errors.Is(err, io.EOF) {
+				t.Fatalf("expected stream EOF before session shutdown, got %v", err)
+			}
+			if session.Context().Err() != nil {
+				t.Fatal("session closed before peer could act on the redirect")
+			}
+			if tt.peerCloses {
+				if err := session.CloseWithError(0, "redirect received"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			select {
+			case <-session.Context().Done():
+			case <-ctx.Done():
+				t.Fatal("redirect session was not reclaimed")
+			}
+			if elapsed := time.Since(joinStarted); !tt.peerCloses && elapsed < writeTimeout {
+				t.Fatalf("server closed idle redirect session after %s, before the %s drain timeout", elapsed, writeTimeout)
+			}
+		})
+	}
 }
 
 func TestRealWebTransportUsesSharedRoomProtocol(t *testing.T) {
