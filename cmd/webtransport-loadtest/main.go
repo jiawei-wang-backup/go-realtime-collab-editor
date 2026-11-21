@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"os"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -42,6 +43,7 @@ type config struct {
 	online             time.Duration
 	editInterval       time.Duration
 	editCount          int
+	connectRetries     int
 	password           string
 	prefix             string
 }
@@ -53,6 +55,7 @@ type report struct {
 	PreparationSeconds            float64           `json:"preparation_seconds"`
 	JoinSuccess                   int64             `json:"join_success"`
 	JoinFailures                  int64             `json:"join_failures"`
+	JoinRetries                   int64             `json:"join_retries"`
 	JoinErrorSamples              map[string]int    `json:"join_error_samples,omitempty"`
 	Redirects                     int64             `json:"redirects"`
 	Edits                         int64             `json:"edits"`
@@ -256,13 +259,14 @@ func run() error {
 	var editLatencies []time.Duration
 	var joinMu, editMu, joinErrorMu sync.Mutex
 	joinErrorSamples := make(map[string]int)
-	var joins, joinFailures, redirects, edits, editFailures, remoteUpdates, disconnects atomic.Int64
+	var joins, joinFailures, joinRetries, redirects, edits, editFailures, remoteUpdates, disconnects atomic.Int64
 	var maxObservedVersion atomic.Uint64
 	tracker := newConvergenceTracker(docs)
 	sessions := make([]*session, 0, cfg.clients)
 	for i := range users {
 		started := time.Now()
-		current, count, err := connect(ctx, cfg, tokens[i], docs[i%len(docs)])
+		current, count, retries, err := connectWithRetry(ctx, cfg, tokens[i], docs[i%len(docs)])
+		joinRetries.Add(int64(retries))
 		if err != nil {
 			joinFailures.Add(1)
 			joinErrorMu.Lock()
@@ -289,7 +293,7 @@ func run() error {
 		}
 	}
 
-	report := report{Clients: cfg.clients, Documents: cfg.documents, PreparationConcurrency: cfg.prepareConcurrency, PreparationSeconds: prepSeconds, JoinSuccess: joins.Load(), JoinFailures: joinFailures.Load(), JoinErrorSamples: joinErrorSamples, Redirects: redirects.Load(), LogicalSessions: len(sessions), TransportInstances: len(sessions), UnderlyingConnectionsMeasured: false}
+	report := report{Clients: cfg.clients, Documents: cfg.documents, PreparationConcurrency: cfg.prepareConcurrency, PreparationSeconds: prepSeconds, JoinSuccess: joins.Load(), JoinFailures: joinFailures.Load(), JoinRetries: joinRetries.Load(), JoinErrorSamples: joinErrorSamples, Redirects: redirects.Load(), LogicalSessions: len(sessions), TransportInstances: len(sessions), UnderlyingConnectionsMeasured: false}
 	if len(sessions) != cfg.clients {
 		closeSessions(sessions)
 		return emitReport(report, fmt.Errorf("join incomplete: success=%d target=%d", len(sessions), cfg.clients))
@@ -373,13 +377,14 @@ func parseConfig() (config, error) {
 	flag.DurationVar(&cfg.online, "online", durationEnv("WT_LOAD_ONLINE", time.Minute), "online duration")
 	flag.DurationVar(&cfg.editInterval, "edit-interval", durationEnv("WT_LOAD_EDIT_INTERVAL", 0), "per-session edit interval")
 	flag.IntVar(&cfg.editCount, "edit-count", intEnv("WT_LOAD_EDIT_COUNT", 0), "edits per session")
+	flag.IntVar(&cfg.connectRetries, "connect-retries", intEnv("WT_LOAD_CONNECT_RETRIES", 0), "retries after WebTransport Dial failures")
 	flag.StringVar(&cfg.password, "password", os.Getenv("WT_LOAD_PASSWORD"), "test password")
 	flag.StringVar(&cfg.prefix, "prefix", envOr("WT_LOAD_PREFIX", "wt-load"), "account prefix")
 	flag.Parse()
 	if cfg.apiURL == "" || *endpoints == "" || cfg.caFile == "" || cfg.password == "" {
 		return cfg, errors.New("api, endpoints, ca and password are required")
 	}
-	if cfg.clients < 1 || cfg.documents < 1 || cfg.prepareConcurrency < 1 || cfg.ramp < 0 || cfg.online <= 0 || cfg.editCount < 0 || cfg.editInterval < 0 {
+	if cfg.clients < 1 || cfg.documents < 1 || cfg.prepareConcurrency < 1 || cfg.ramp < 0 || cfg.online <= 0 || cfg.editCount < 0 || cfg.editInterval < 0 || cfg.connectRetries < 0 {
 		return cfg, errors.New("invalid load configuration")
 	}
 	maxUsername := fmt.Sprintf("%s-user-%d-%s", cfg.prefix, cfg.clients-1, "000000000000")
@@ -424,6 +429,30 @@ func normalizeEndpoint(value string) (string, error) {
 		return "", fmt.Errorf("owner redirect endpoint has invalid path")
 	}
 	return parsed.String(), nil
+}
+
+func connectWithRetry(ctx context.Context, cfg config, token, docID string) (*session, int, int, error) {
+	var lastRedirects int
+	var lastErr error
+	var retries int
+	for attempt := 0; attempt <= cfg.connectRetries; attempt++ {
+		current, redirects, err := connect(ctx, cfg, token, docID)
+		lastRedirects = redirects
+		if err == nil {
+			return current, redirects, attempt, nil
+		}
+		lastErr = err
+		if !strings.HasPrefix(err.Error(), "webtransport dial ") || attempt == cfg.connectRetries {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return nil, redirects, attempt, ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+			retries++
+		}
+	}
+	return nil, lastRedirects, retries, lastErr
 }
 
 func connect(ctx context.Context, cfg config, token, docID string) (*session, int, error) {

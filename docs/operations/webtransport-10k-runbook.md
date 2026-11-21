@@ -58,9 +58,17 @@ Mac 本地轻量客户端基线：
 - 第 3 轮：使用更缓的 300 秒接入斜坡，JOIN 4,999/5,000，1 个失败同样为 `timeout: no recent network activity`；没有编辑阶段结果。
 - 两轮失败期间 Room 事件队列峰值均为 0，`collab_etcd_lease_renewal_failures_total` 均为 0；但后续独立诊断轮在准备阶段观察到 node-b 的 etcd node lease lost 和多个 ownership lost，因此不能把所有 5,000 超时归为同一原因。
 
-因此当前结论是：5,000 有一轮完整在线通过，但重复稳定性尚未通过，不能进入 10,000。采样脚本已支持可选 `CLIENT_PID`，并在诊断轮实际采到 Go 发压进程 PID 91863（CPU 峰值约 4.0%，RSS 峰值约 17.8MiB）；该轮服务节点 CPU 峰值约 88.6%/6.1%，RSS 约 38.1/36.3MiB。诊断轮最终观察到 node-b 的 etcd node lease lost 和多个 document ownership lost，随后 node-a REST 连接拒绝，说明至少有一轮失败是准备阶段集群 lease 丢失，不是单纯客户端 Dial 超时。下一步应先拆分准备阶段和在线阶段、降低文档 ownership 准备压力或使用预置会话，再决定是否重跑 5,000。
+因此当前结论是：5,000 在无重试配置下仍有少量 Dial 超时，不能直接进入 10,000。采样脚本已支持可选 `CLIENT_PID`，并在诊断轮实际采到 Go 发压进程 PID 91863（CPU 峰值约 4.0%，RSS 峰值约 17.8MiB）；该轮服务节点 CPU 峰值约 88.6%/6.1%，RSS 约 38.1/36.3MiB。诊断轮最终观察到 node-b 的 etcd node lease lost 和多个 document ownership lost，随后 node-a REST 连接拒绝，说明至少有一轮失败是准备阶段集群 lease 丢失，不是单纯客户端 Dial 超时。
 
-为验证 3 秒 lease 是否是主要因素，fixture 现在支持 `COLLAB_FIXTURE_ETCD_LEASE_TTL` 和 `COLLAB_FIXTURE_JWT_TTL`；仅放宽 lease 但仍使用默认 15 分钟 JWT TTL 的首轮在用户准备到 2,802 时因 owner token 过期返回 401，因此后续复测同时使用 1 小时测试 JWT。使用 `COLLAB_FIXTURE_ETCD_LEASE_TTL=10s`、`COLLAB_FIXTURE_JWT_TTL=1h` 的复测没有再出现 node lease lost 或 ownership 大面积回收，Room 队列仍为 0、lease renewal failures 为 0；但准备阶段升至 1,174.99s，JOIN 为 4,996/5,000，仍有 4 个 `webtransport dial ... timeout: no recent network activity`。资源峰值为 WebTransport 2,761/2,215、goroutine 36,280/29,114、Go heap 约 334.3/224.8MiB、服务 RSS 约 590MiB、CPU 约 91%。这说明放宽 fixture lease 可以消除已观察到的 lease 丢失，但尚未消除少量 Dial 超时，也不能把 5,000 标记为重复稳定通过。
+为验证 3 秒 lease 是否是主要因素，fixture 现在支持 `COLLAB_FIXTURE_ETCD_LEASE_TTL` 和 `COLLAB_FIXTURE_JWT_TTL`；仅放宽 lease 但仍使用默认 15 分钟 JWT TTL 的首轮在用户准备到 2,802 时因 owner token 过期返回 401，因此后续复测同时使用 1 小时测试 JWT。使用 `COLLAB_FIXTURE_ETCD_LEASE_TTL=10s`、`COLLAB_FIXTURE_JWT_TTL=1h` 的无重试复测没有再出现 node lease lost 或 ownership 大面积回收，Room 队列仍为 0、lease renewal failures 为 0；但准备阶段升至 1,174.99s，JOIN 为 4,996/5,000，仍有 4 个 `webtransport dial ... timeout: no recent network activity`。
+
+客户端新增 `-connect-retries`，只对 WebTransport Dial 阶段重试并单独报告 `join_retries`。使用一次重试、10 秒 lease、1 小时 JWT 的两轮独立复测均通过：
+
+- 第 1 轮：JOIN 5,000/5,000，`join_retries=5`，编辑 5,000/5,000，收敛通过，意外断线 0；准备 1,183.71s，JOIN P95 31.005ms，编辑 ACK P95 31.796ms。
+- 第 2 轮：JOIN 5,000/5,000，`join_retries=2`，编辑 5,000/5,000，收敛通过，意外断线 0；准备 1,180.49s，JOIN P95 29.161ms，编辑 ACK P95 32.122ms。
+- 两轮 Room 队列均为 0，etcd lease renewal failures 均为 0；服务 RSS 峰值约 628/549MiB，CPU 峰值约 147.8%/118.1%，goroutine 峰值约 33,841/34,497。
+
+这证明 Mac 侧在明确记录重试的条件下已得到两轮完整 5,000 在线收敛结果；但准备阶段耗时约 19.7 分钟，且仍有原始 Dial 失败需要重试，不能把它等同于无重试的零失败稳定性。
 
 当前尚未声称覆盖：
 
