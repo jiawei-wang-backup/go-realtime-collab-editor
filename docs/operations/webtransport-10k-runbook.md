@@ -73,6 +73,13 @@ Mac 本地轻量客户端基线：
 当前尚未声称覆盖：
 
 - Go 轻量客户端的 Owner Failover 后自动重连和 `RESUME`/`SYNC`/`RESYNC` 完整状态机；当前只具备 AUTH/JOIN/Owner Redirect/EDIT/ACK 和内容收敛验证，Failover 仍以既有 Chrome harness 结果为基线。
+
+5,000 重试稳定后对 Go Failover 可测性的评估：
+
+- 现有 Go 客户端没有保存 session token/doc version 后重新建立 WebTransport 会话的状态机，因此不能直接测量 Owner 失效后的自动 `RESUME`。
+- 需要新增的最小观测顺序是：旧连接关闭并记录旧版本 → 新连接 `AUTH` → `RESUME(last_version)` → 接收 `SYNC` 或 `RESYNC_REQUIRED` → 应用快照/增量操作 → 恢复编辑并验证最终版本/内容。
+- Owner Redirect 需要在 `RESUME` 前后都保留；旧连接必须标记为预期关闭，避免把 failover 关闭计为意外断线；报告至少应分开 `resume_success`、`resync_count`、`resume_failures` 和最终收敛。
+- 因此 5,000 在线收敛已具备进入该客户端状态机开发的条件，但在 Go 客户端补齐前，不能声称 Mac 侧 Go Failover/RESUME 已验证。
 - 多写入者 OT 冲突和最终内容收敛；
 - 对端更新 P95；
 - 独立观测底层 QUIC 连接数；
