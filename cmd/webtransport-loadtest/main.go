@@ -212,7 +212,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), cfg.online+cfg.ramp+10*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.online+cfg.ramp+30*time.Minute)
 	defer cancel()
 
 	prepStart := time.Now()
