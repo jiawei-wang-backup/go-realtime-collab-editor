@@ -60,6 +60,8 @@ Mac 本地轻量客户端基线：
 
 因此当前结论是：5,000 有一轮完整在线通过，但重复稳定性尚未通过，不能进入 10,000。采样脚本已支持可选 `CLIENT_PID`，并在诊断轮实际采到 Go 发压进程 PID 91863（CPU 峰值约 4.0%，RSS 峰值约 17.8MiB）；该轮服务节点 CPU 峰值约 88.6%/6.1%，RSS 约 38.1/36.3MiB。诊断轮最终观察到 node-b 的 etcd node lease lost 和多个 document ownership lost，随后 node-a REST 连接拒绝，说明至少有一轮失败是准备阶段集群 lease 丢失，不是单纯客户端 Dial 超时。下一步应先拆分准备阶段和在线阶段、降低文档 ownership 准备压力或使用预置会话，再决定是否重跑 5,000。
 
+为验证 3 秒 lease 是否是主要因素，fixture 现在支持 `COLLAB_FIXTURE_ETCD_LEASE_TTL` 和 `COLLAB_FIXTURE_JWT_TTL`；仅放宽 lease 但仍使用默认 15 分钟 JWT TTL 的首轮在用户准备到 2,802 时因 owner token 过期返回 401，因此后续复测同时使用 1 小时测试 JWT。使用 `COLLAB_FIXTURE_ETCD_LEASE_TTL=10s`、`COLLAB_FIXTURE_JWT_TTL=1h` 的复测没有再出现 node lease lost 或 ownership 大面积回收，Room 队列仍为 0、lease renewal failures 为 0；但准备阶段升至 1,174.99s，JOIN 为 4,996/5,000，仍有 4 个 `webtransport dial ... timeout: no recent network activity`。资源峰值为 WebTransport 2,761/2,215、goroutine 36,280/29,114、Go heap 约 334.3/224.8MiB、服务 RSS 约 590MiB、CPU 约 91%。这说明放宽 fixture lease 可以消除已观察到的 lease 丢失，但尚未消除少量 Dial 超时，也不能把 5,000 标记为重复稳定通过。
+
 当前尚未声称覆盖：
 
 - Go 轻量客户端的 Owner Failover 后自动重连和 `RESUME`/`SYNC`/`RESYNC` 完整状态机；当前只具备 AUTH/JOIN/Owner Redirect/EDIT/ACK 和内容收敛验证，Failover 仍以既有 Chrome harness 结果为基线。
