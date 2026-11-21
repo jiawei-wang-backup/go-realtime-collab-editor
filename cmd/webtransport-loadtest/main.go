@@ -28,26 +28,28 @@ import (
 )
 
 type config struct {
-	apiURL       string
-	endpoints    []string
-	caFile       string
-	serverName   string
-	origin       string
-	tlsConfig    *tls.Config
-	httpClient   *http.Client
-	clients      int
-	documents    int
-	ramp         time.Duration
-	online       time.Duration
-	editInterval time.Duration
-	editCount    int
-	password     string
-	prefix       string
+	apiURL             string
+	endpoints          []string
+	caFile             string
+	serverName         string
+	origin             string
+	tlsConfig          *tls.Config
+	httpClient         *http.Client
+	clients            int
+	documents          int
+	prepareConcurrency int
+	ramp               time.Duration
+	online             time.Duration
+	editInterval       time.Duration
+	editCount          int
+	password           string
+	prefix             string
 }
 
 type report struct {
 	Clients                       int               `json:"clients"`
 	Documents                     int               `json:"documents"`
+	PreparationConcurrency        int               `json:"preparation_concurrency"`
 	PreparationSeconds            float64           `json:"preparation_seconds"`
 	JoinSuccess                   int64             `json:"join_success"`
 	JoinFailures                  int64             `json:"join_failures"`
@@ -146,6 +148,58 @@ func (tracker *convergenceTracker) snapshot() (bool, map[string]uint64, map[stri
 	return len(problems) == 0, versions, contents, problems
 }
 
+func runIndexed(ctx context.Context, count, concurrency int, work func(int) error) error {
+	if count == 0 {
+		return nil
+	}
+	if concurrency < 1 {
+		return errors.New("preparation concurrency must be positive")
+	}
+	workCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	jobs := make(chan int)
+	var workers sync.WaitGroup
+	var firstErr error
+	var errMu sync.Mutex
+	for worker := 0; worker < concurrency; worker++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for {
+				select {
+				case <-workCtx.Done():
+					return
+				case index, ok := <-jobs:
+					if !ok {
+						return
+					}
+					if err := work(index); err != nil {
+						errMu.Lock()
+						if firstErr == nil {
+							firstErr = err
+							cancel()
+						}
+						errMu.Unlock()
+					}
+				}
+			}
+		}()
+	}
+	for index := 0; index < count; index++ {
+		select {
+		case <-workCtx.Done():
+			break
+		case jobs <- index:
+		}
+		if workCtx.Err() != nil {
+			break
+		}
+	}
+	close(jobs)
+	workers.Wait()
+	return firstErr
+}
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -169,14 +223,22 @@ func run() error {
 	docs := make([]string, cfg.documents)
 	for i := range docs {
 		docs[i] = fmt.Sprintf("wt-load-%s-%d", randomID(), i)
+	}
+	if err := runIndexed(ctx, len(docs), cfg.prepareConcurrency, func(i int) error {
 		if err := createDocument(ctx, cfg.httpClient, cfg.apiURL, ownerToken, docs[i]); err != nil {
 			return fmt.Errorf("create document %s: %w", docs[i], err)
 		}
+		return nil
+	}); err != nil {
+		return err
 	}
 	users := make([]string, cfg.clients)
 	tokens := make([]string, cfg.clients)
 	for i := range users {
 		users[i] = fmt.Sprintf("%s-user-%d-%s", cfg.prefix, i, randomID())
+	}
+	if err := runIndexed(ctx, len(users), cfg.prepareConcurrency, func(i int) error {
+		var err error
 		tokens[i], err = registerAndLogin(ctx, cfg.httpClient, cfg.apiURL, users[i], cfg.password)
 		if err != nil {
 			return fmt.Errorf("register user %d: %w", i, err)
@@ -184,6 +246,9 @@ func run() error {
 		if err := grantWrite(ctx, cfg.httpClient, cfg.apiURL, ownerToken, tokens[i], docs[i%len(docs)]); err != nil {
 			return fmt.Errorf("grant user %d: %w", i, err)
 		}
+		return nil
+	}); err != nil {
+		return err
 	}
 	prepSeconds := time.Since(prepStart).Seconds()
 
@@ -224,7 +289,7 @@ func run() error {
 		}
 	}
 
-	report := report{Clients: cfg.clients, Documents: cfg.documents, PreparationSeconds: prepSeconds, JoinSuccess: joins.Load(), JoinFailures: joinFailures.Load(), JoinErrorSamples: joinErrorSamples, Redirects: redirects.Load(), LogicalSessions: len(sessions), TransportInstances: len(sessions), UnderlyingConnectionsMeasured: false}
+	report := report{Clients: cfg.clients, Documents: cfg.documents, PreparationConcurrency: cfg.prepareConcurrency, PreparationSeconds: prepSeconds, JoinSuccess: joins.Load(), JoinFailures: joinFailures.Load(), JoinErrorSamples: joinErrorSamples, Redirects: redirects.Load(), LogicalSessions: len(sessions), TransportInstances: len(sessions), UnderlyingConnectionsMeasured: false}
 	if len(sessions) != cfg.clients {
 		closeSessions(sessions)
 		return emitReport(report, fmt.Errorf("join incomplete: success=%d target=%d", len(sessions), cfg.clients))
@@ -303,6 +368,7 @@ func parseConfig() (config, error) {
 	flag.StringVar(&cfg.origin, "origin", envOr("WT_LOAD_ORIGIN", "https://localhost"), "WebTransport Origin header")
 	flag.IntVar(&cfg.clients, "clients", intEnv("WT_LOAD_CLIENTS", 50), "logical sessions")
 	flag.IntVar(&cfg.documents, "documents", intEnv("WT_LOAD_DOCUMENTS", 200), "documents")
+	flag.IntVar(&cfg.prepareConcurrency, "prepare-concurrency", intEnv("WT_LOAD_PREPARE_CONCURRENCY", 4), "bounded REST preparation concurrency")
 	flag.DurationVar(&cfg.ramp, "ramp", durationEnv("WT_LOAD_RAMP", 0), "ramp duration")
 	flag.DurationVar(&cfg.online, "online", durationEnv("WT_LOAD_ONLINE", time.Minute), "online duration")
 	flag.DurationVar(&cfg.editInterval, "edit-interval", durationEnv("WT_LOAD_EDIT_INTERVAL", 0), "per-session edit interval")
@@ -313,7 +379,7 @@ func parseConfig() (config, error) {
 	if cfg.apiURL == "" || *endpoints == "" || cfg.caFile == "" || cfg.password == "" {
 		return cfg, errors.New("api, endpoints, ca and password are required")
 	}
-	if cfg.clients < 1 || cfg.documents < 1 || cfg.ramp < 0 || cfg.online <= 0 || cfg.editCount < 0 || cfg.editInterval < 0 {
+	if cfg.clients < 1 || cfg.documents < 1 || cfg.prepareConcurrency < 1 || cfg.ramp < 0 || cfg.online <= 0 || cfg.editCount < 0 || cfg.editInterval < 0 {
 		return cfg, errors.New("invalid load configuration")
 	}
 	maxUsername := fmt.Sprintf("%s-user-%d-%s", cfg.prefix, cfg.clients-1, "000000000000")
