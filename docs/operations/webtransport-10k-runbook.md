@@ -56,13 +56,13 @@ Mac 本地轻量客户端基线：
 
 - 第 2 轮：JOIN 4,997/5,000，3 个失败均为 `timeout: no recent network activity`；没有编辑阶段结果。
 - 第 3 轮：使用更缓的 300 秒接入斜坡，JOIN 4,999/5,000，1 个失败同样为 `timeout: no recent network activity`；没有编辑阶段结果。
-- 两轮失败期间 Room 事件队列峰值均为 0，etcd lease renewal failures 均为 0，服务端没有观察到对应的 Room/etcd 故障。由于客户端当前没有独立 CPU/RSS 采样，这些超时暂不能归因于服务端或发压机单侧。
+- 两轮失败期间 Room 事件队列峰值均为 0，`collab_etcd_lease_renewal_failures_total` 均为 0；但后续独立诊断轮在准备阶段观察到 node-b 的 etcd node lease lost 和多个 ownership lost，因此不能把所有 5,000 超时归为同一原因。
 
-因此当前结论是：5,000 有一轮完整在线通过，但重复稳定性尚未通过，不能进入 10,000。采样脚本已支持可选 `CLIENT_PID`，下一步用它补充发压机 CPU/RSS，并结合 WebTransport Dial/QUIC 超时阶段诊断；也可以改用预置会话降低准备窗口，再决定是否重跑 5,000。
+因此当前结论是：5,000 有一轮完整在线通过，但重复稳定性尚未通过，不能进入 10,000。采样脚本已支持可选 `CLIENT_PID`，并在诊断轮实际采到 Go 发压进程 PID 91863（CPU 峰值约 4.0%，RSS 峰值约 17.8MiB）；该轮服务节点 CPU 峰值约 88.6%/6.1%，RSS 约 38.1/36.3MiB。诊断轮最终观察到 node-b 的 etcd node lease lost 和多个 document ownership lost，随后 node-a REST 连接拒绝，说明至少有一轮失败是准备阶段集群 lease 丢失，不是单纯客户端 Dial 超时。下一步应先拆分准备阶段和在线阶段、降低文档 ownership 准备压力或使用预置会话，再决定是否重跑 5,000。
 
 当前尚未声称覆盖：
 
-- RESUME/SYNC/RESYNC 的完整断线恢复状态机；
+- Go 轻量客户端的 Owner Failover 后自动重连和 `RESUME`/`SYNC`/`RESYNC` 完整状态机；当前只具备 AUTH/JOIN/Owner Redirect/EDIT/ACK 和内容收敛验证，Failover 仍以既有 Chrome harness 结果为基线。
 - 多写入者 OT 冲突和最终内容收敛；
 - 对端更新 P95；
 - 独立观测底层 QUIC 连接数；

@@ -438,23 +438,23 @@ func connect(ctx context.Context, cfg config, token, docID string) (*session, in
 		_, wtSession, err := transport.Dial(ctx, endpoint, http.Header{"Origin": []string{cfg.origin}})
 		if err != nil {
 			_ = transport.Close()
-			return nil, redirects, err
+			return nil, redirects, fmt.Errorf("webtransport dial %s: %w", endpoint, err)
 		}
 		stream, err := wtSession.OpenStreamSync(ctx)
 		if err != nil {
 			_ = wtSession.CloseWithError(0, "stream failed")
 			_ = transport.Close()
-			return nil, redirects, err
+			return nil, redirects, fmt.Errorf("open WebTransport stream: %w", err)
 		}
 		current := &session{transport: transport, session: wtSession, stream: stream, docID: docID, done: make(chan struct{})}
 		if err := current.write(protocol.Message{Type: protocol.TypeAuth, Token: token}); err != nil {
 			current.close()
-			return nil, redirects, err
+			return nil, redirects, fmt.Errorf("AUTH write: %w", err)
 		}
 		message, err := current.read()
 		if err != nil {
 			current.close()
-			return nil, redirects, err
+			return nil, redirects, fmt.Errorf("AUTH read: %w", err)
 		}
 		if message.Type != protocol.TypeAuthOK {
 			current.close()
@@ -462,12 +462,12 @@ func connect(ctx context.Context, cfg config, token, docID string) (*session, in
 		}
 		if err := current.write(protocol.Message{Type: protocol.TypeJoin, DocID: docID}); err != nil {
 			current.close()
-			return nil, redirects, err
+			return nil, redirects, fmt.Errorf("JOIN write: %w", err)
 		}
 		message, err = current.read()
 		if err != nil {
 			current.close()
-			return nil, redirects, err
+			return nil, redirects, fmt.Errorf("JOIN read: %w", err)
 		}
 		switch message.Type {
 		case protocol.TypeJoined:
