@@ -43,6 +43,7 @@ type config struct {
 	online             time.Duration
 	editInterval       time.Duration
 	editCount          int
+	editRetries        int
 	connectRetries     int
 	password           string
 	prefix             string
@@ -68,6 +69,7 @@ type report struct {
 	Redirects                     int64             `json:"redirects"`
 	Edits                         int64             `json:"edits"`
 	EditFailures                  int64             `json:"edit_failures"`
+	EditRetries                   int               `json:"edit_retries"`
 	RemoteUpdates                 int64             `json:"remote_updates"`
 	MaxObservedVersion            uint64            `json:"max_observed_version"`
 	ConvergenceOK                 bool              `json:"convergence_ok"`
@@ -101,7 +103,10 @@ type session struct {
 	err          atomic.Value
 }
 
-type pendingAck struct{ done chan struct{} }
+type pendingAck struct {
+	done chan struct{}
+	err  chan error
+}
 
 type convergenceTracker struct {
 	mu         sync.Mutex
@@ -308,7 +313,7 @@ func run() error {
 	}
 
 	if len(sessions) != cfg.clients {
-		report := report{Clients: cfg.clients, Documents: cfg.documents, PreparationConcurrency: cfg.prepareConcurrency, PreparationSeconds: prepSeconds, JoinSuccess: joins.Load(), JoinFailures: joinFailures.Load(), JoinRetries: joinRetries.Load(), ResumeErrorSamples: resumeErrorSamples, JoinErrorSamples: joinErrorSamples, Redirects: redirects.Load(), LogicalSessions: len(sessions), TransportInstances: len(sessions), UnderlyingConnectionsMeasured: false}
+		report := report{Clients: cfg.clients, Documents: cfg.documents, PreparationConcurrency: cfg.prepareConcurrency, PreparationSeconds: prepSeconds, EditRetries: cfg.editRetries, JoinSuccess: joins.Load(), JoinFailures: joinFailures.Load(), JoinRetries: joinRetries.Load(), ResumeErrorSamples: resumeErrorSamples, JoinErrorSamples: joinErrorSamples, Redirects: redirects.Load(), LogicalSessions: len(sessions), TransportInstances: len(sessions), UnderlyingConnectionsMeasured: false}
 		closeSessions(sessions)
 		return emitReport(report, fmt.Errorf("join incomplete: success=%d target=%d", len(sessions), cfg.clients))
 	}
@@ -353,7 +358,7 @@ func run() error {
 		go resumed.receive(&disconnects, &remoteUpdates, &maxObservedVersion, tracker)
 	}
 
-	report := report{Clients: cfg.clients, Documents: cfg.documents, PreparationConcurrency: cfg.prepareConcurrency, PreparationSeconds: prepSeconds, JoinSuccess: joins.Load(), JoinFailures: joinFailures.Load(), JoinRetries: joinRetries.Load(), ResumeAttempts: resumeAttempts.Load(), ResumeSuccess: resumeSuccess.Load(), ResumeFailures: resumeFailures.Load(), ResyncCount: resyncCount.Load(), ResumeErrorSamples: resumeErrorSamples, JoinErrorSamples: joinErrorSamples, Redirects: redirects.Load(), LogicalSessions: len(sessions), TransportInstances: len(sessions), UnderlyingConnectionsMeasured: false}
+	report := report{Clients: cfg.clients, Documents: cfg.documents, PreparationConcurrency: cfg.prepareConcurrency, PreparationSeconds: prepSeconds, EditRetries: cfg.editRetries, JoinSuccess: joins.Load(), JoinFailures: joinFailures.Load(), JoinRetries: joinRetries.Load(), ResumeAttempts: resumeAttempts.Load(), ResumeSuccess: resumeSuccess.Load(), ResumeFailures: resumeFailures.Load(), ResyncCount: resyncCount.Load(), ResumeErrorSamples: resumeErrorSamples, JoinErrorSamples: joinErrorSamples, Redirects: redirects.Load(), LogicalSessions: len(sessions), TransportInstances: len(sessions), UnderlyingConnectionsMeasured: false}
 	if resumeFailures.Load() > 0 {
 		closeSessions(sessions)
 		return emitReport(report, fmt.Errorf("resume incomplete: success=%d target=%d", resumeSuccess.Load(), resumeAttempts.Load()))
@@ -405,24 +410,35 @@ func run() error {
 				}
 				requestID := fmt.Sprintf("%s-edit-%d-%d", cfg.prefix, i, editCounts[i])
 				editCounts[i]++
-				ack := &pendingAck{done: make(chan struct{})}
-				current.acks.Store(requestID, ack)
 				operationStarted := time.Now()
-				base := current.version.Load()
 				op := collab.Operation{Kind: collab.OperationInsert, Position: 0, Text: "x"}
-				if err := current.write(protocol.Message{Type: protocol.TypeEdit, DocID: current.docID, RequestID: requestID, BaseVersion: base, Operation: &op}); err != nil {
-					current.acks.Delete(requestID)
-					editFailures.Add(1)
-					continue
+				succeeded := false
+				for attempt := 0; attempt <= cfg.editRetries; attempt++ {
+					ack := &pendingAck{done: make(chan struct{}), err: make(chan error, 1)}
+					current.acks.Store(requestID, ack)
+					base := current.version.Load()
+					if err := current.write(protocol.Message{Type: protocol.TypeEdit, DocID: current.docID, RequestID: requestID, BaseVersion: base, Operation: &op}); err != nil {
+						current.acks.Delete(requestID)
+						continue
+					}
+					select {
+					case <-ack.done:
+						editMu.Lock()
+						editLatencies = append(editLatencies, time.Since(operationStarted))
+						editMu.Unlock()
+						edits.Add(1)
+						succeeded = true
+					case <-ack.err:
+						current.acks.Delete(requestID)
+						time.Sleep(250 * time.Millisecond)
+					case <-time.After(10 * time.Second):
+						current.acks.Delete(requestID)
+					}
+					if succeeded {
+						break
+					}
 				}
-				select {
-				case <-ack.done:
-					editMu.Lock()
-					editLatencies = append(editLatencies, time.Since(operationStarted))
-					editMu.Unlock()
-					edits.Add(1)
-				case <-time.After(10 * time.Second):
-					current.acks.Delete(requestID)
+				if !succeeded {
 					editFailures.Add(1)
 				}
 			}
@@ -445,6 +461,7 @@ func parseConfig() (config, error) {
 	flag.DurationVar(&cfg.online, "online", durationEnv("WT_LOAD_ONLINE", time.Minute), "online duration")
 	flag.DurationVar(&cfg.editInterval, "edit-interval", durationEnv("WT_LOAD_EDIT_INTERVAL", 0), "per-session edit interval")
 	flag.IntVar(&cfg.editCount, "edit-count", intEnv("WT_LOAD_EDIT_COUNT", 0), "edits per session")
+	flag.IntVar(&cfg.editRetries, "edit-retries", intEnv("WT_LOAD_EDIT_RETRIES", 0), "retries for transient edit failures")
 	flag.IntVar(&cfg.connectRetries, "connect-retries", intEnv("WT_LOAD_CONNECT_RETRIES", 0), "retries after WebTransport Dial failures")
 	flag.StringVar(&cfg.password, "password", os.Getenv("WT_LOAD_PASSWORD"), "test password")
 	flag.StringVar(&cfg.prefix, "prefix", envOr("WT_LOAD_PREFIX", "wt-load"), "account prefix")
@@ -455,7 +472,7 @@ func parseConfig() (config, error) {
 	if cfg.apiURL == "" || *endpoints == "" || cfg.caFile == "" || cfg.password == "" {
 		return cfg, errors.New("api, endpoints, ca and password are required")
 	}
-	if cfg.clients < 1 || cfg.documents < 1 || cfg.prepareConcurrency < 1 || cfg.ramp < 0 || cfg.online <= 0 || cfg.editCount < 0 || cfg.editInterval < 0 || cfg.connectRetries < 0 || cfg.resumeCount < 0 || cfg.resumeCount > cfg.clients || cfg.resumeDelay < 0 || cfg.resumeSettle < 0 {
+	if cfg.clients < 1 || cfg.documents < 1 || cfg.prepareConcurrency < 1 || cfg.ramp < 0 || cfg.online <= 0 || cfg.editCount < 0 || cfg.editRetries < 0 || cfg.editInterval < 0 || cfg.connectRetries < 0 || cfg.resumeCount < 0 || cfg.resumeCount > cfg.clients || cfg.resumeDelay < 0 || cfg.resumeSettle < 0 {
 		return cfg, errors.New("invalid load configuration")
 	}
 	maxUsername := fmt.Sprintf("%s-user-%d-%s", cfg.prefix, cfg.clients-1, "000000000000")
@@ -673,6 +690,15 @@ func (s *session) receive(disconnects, remoteUpdates *atomic.Int64, maxObservedV
 				s.err.Store(err)
 			}
 			return
+		}
+		if message.Type == protocol.TypeError {
+			if value, ok := s.acks.LoadAndDelete(message.RequestID); ok {
+				ack := value.(*pendingAck)
+				ack.err <- fmt.Errorf("%s: %s", message.Code, message.Message)
+			} else {
+				remoteUpdates.Add(1)
+			}
+			continue
 		}
 		if message.Type == protocol.TypeEditApplied {
 			tracker.record(message)
