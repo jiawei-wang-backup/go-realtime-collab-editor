@@ -39,6 +39,7 @@ type config struct {
 	clients            int
 	documents          int
 	prepareConcurrency int
+	prepareRetries     int
 	ramp               time.Duration
 	online             time.Duration
 	editInterval       time.Duration
@@ -56,6 +57,7 @@ type report struct {
 	Clients                       int               `json:"clients"`
 	Documents                     int               `json:"documents"`
 	PreparationConcurrency        int               `json:"preparation_concurrency"`
+	PreparationRetries            int               `json:"preparation_retries"`
 	PreparationSeconds            float64           `json:"preparation_seconds"`
 	JoinSuccess                   int64             `json:"join_success"`
 	JoinFailures                  int64             `json:"join_failures"`
@@ -169,6 +171,20 @@ func (tracker *convergenceTracker) snapshot() (bool, map[string]uint64, map[stri
 	return len(problems) == 0, versions, contents, problems
 }
 
+func retryPreparation(ctx context.Context, retries int, work func() error) error {
+	for attempt := 0; ; attempt++ {
+		err := work()
+		if err == nil || attempt >= retries {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Duration(attempt+1) * 250 * time.Millisecond):
+		}
+	}
+}
+
 func runIndexed(ctx context.Context, count, concurrency int, work func(int) error) error {
 	if count == 0 {
 		return nil
@@ -246,7 +262,9 @@ func run() error {
 		docs[i] = fmt.Sprintf("wt-load-%s-%d", randomID(), i)
 	}
 	if err := runIndexed(ctx, len(docs), cfg.prepareConcurrency, func(i int) error {
-		if err := createDocument(ctx, cfg.httpClient, cfg.apiURL, ownerToken, docs[i]); err != nil {
+		if err := retryPreparation(ctx, cfg.prepareRetries, func() error {
+			return createDocument(ctx, cfg.httpClient, cfg.apiURL, ownerToken, docs[i])
+		}); err != nil {
 			return fmt.Errorf("create document %s: %w", docs[i], err)
 		}
 		return nil
@@ -260,11 +278,16 @@ func run() error {
 	}
 	if err := runIndexed(ctx, len(users), cfg.prepareConcurrency, func(i int) error {
 		var err error
-		tokens[i], err = registerAndLogin(ctx, cfg.httpClient, cfg.apiURL, users[i], cfg.password)
+		err = retryPreparation(ctx, cfg.prepareRetries, func() error {
+			tokens[i], err = registerAndLogin(ctx, cfg.httpClient, cfg.apiURL, users[i], cfg.password)
+			return err
+		})
 		if err != nil {
 			return fmt.Errorf("register user %d: %w", i, err)
 		}
-		if err := grantWrite(ctx, cfg.httpClient, cfg.apiURL, ownerToken, tokens[i], docs[i%len(docs)]); err != nil {
+		if err := retryPreparation(ctx, cfg.prepareRetries, func() error {
+			return grantWrite(ctx, cfg.httpClient, cfg.apiURL, ownerToken, tokens[i], docs[i%len(docs)])
+		}); err != nil {
 			return fmt.Errorf("grant user %d: %w", i, err)
 		}
 		return nil
@@ -315,7 +338,7 @@ func run() error {
 	}
 
 	if len(sessions) != cfg.clients {
-		report := report{Clients: cfg.clients, Documents: cfg.documents, PreparationConcurrency: cfg.prepareConcurrency, PreparationSeconds: prepSeconds, EditRetries: cfg.editRetries, EditErrorSamples: editErrorSamples, JoinSuccess: joins.Load(), JoinFailures: joinFailures.Load(), JoinRetries: joinRetries.Load(), ResumeErrorSamples: resumeErrorSamples, JoinErrorSamples: joinErrorSamples, Redirects: redirects.Load(), LogicalSessions: len(sessions), TransportInstances: len(sessions), UnderlyingConnectionsMeasured: false}
+		report := report{Clients: cfg.clients, Documents: cfg.documents, PreparationConcurrency: cfg.prepareConcurrency, PreparationRetries: cfg.prepareRetries, PreparationSeconds: prepSeconds, EditRetries: cfg.editRetries, EditErrorSamples: editErrorSamples, JoinSuccess: joins.Load(), JoinFailures: joinFailures.Load(), JoinRetries: joinRetries.Load(), ResumeErrorSamples: resumeErrorSamples, JoinErrorSamples: joinErrorSamples, Redirects: redirects.Load(), LogicalSessions: len(sessions), TransportInstances: len(sessions), UnderlyingConnectionsMeasured: false}
 		closeSessions(sessions)
 		return emitReport(report, fmt.Errorf("join incomplete: success=%d target=%d", len(sessions), cfg.clients))
 	}
@@ -360,7 +383,7 @@ func run() error {
 		go resumed.receive(&disconnects, &remoteUpdates, &maxObservedVersion, tracker)
 	}
 
-	report := report{Clients: cfg.clients, Documents: cfg.documents, PreparationConcurrency: cfg.prepareConcurrency, PreparationSeconds: prepSeconds, EditRetries: cfg.editRetries, EditErrorSamples: editErrorSamples, JoinSuccess: joins.Load(), JoinFailures: joinFailures.Load(), JoinRetries: joinRetries.Load(), ResumeAttempts: resumeAttempts.Load(), ResumeSuccess: resumeSuccess.Load(), ResumeFailures: resumeFailures.Load(), ResyncCount: resyncCount.Load(), ResumeErrorSamples: resumeErrorSamples, JoinErrorSamples: joinErrorSamples, Redirects: redirects.Load(), LogicalSessions: len(sessions), TransportInstances: len(sessions), UnderlyingConnectionsMeasured: false}
+	report := report{Clients: cfg.clients, Documents: cfg.documents, PreparationConcurrency: cfg.prepareConcurrency, PreparationRetries: cfg.prepareRetries, PreparationSeconds: prepSeconds, EditRetries: cfg.editRetries, EditErrorSamples: editErrorSamples, JoinSuccess: joins.Load(), JoinFailures: joinFailures.Load(), JoinRetries: joinRetries.Load(), ResumeAttempts: resumeAttempts.Load(), ResumeSuccess: resumeSuccess.Load(), ResumeFailures: resumeFailures.Load(), ResyncCount: resyncCount.Load(), ResumeErrorSamples: resumeErrorSamples, JoinErrorSamples: joinErrorSamples, Redirects: redirects.Load(), LogicalSessions: len(sessions), TransportInstances: len(sessions), UnderlyingConnectionsMeasured: false}
 	if resumeFailures.Load() > 0 {
 		closeSessions(sessions)
 		return emitReport(report, fmt.Errorf("resume incomplete: success=%d target=%d", resumeSuccess.Load(), resumeAttempts.Load()))
@@ -464,6 +487,7 @@ func parseConfig() (config, error) {
 	flag.IntVar(&cfg.clients, "clients", intEnv("WT_LOAD_CLIENTS", 50), "logical sessions")
 	flag.IntVar(&cfg.documents, "documents", intEnv("WT_LOAD_DOCUMENTS", 200), "documents")
 	flag.IntVar(&cfg.prepareConcurrency, "prepare-concurrency", intEnv("WT_LOAD_PREPARE_CONCURRENCY", 4), "bounded REST preparation concurrency")
+	flag.IntVar(&cfg.prepareRetries, "prepare-retries", intEnv("WT_LOAD_PREPARE_RETRIES", 1), "retries for transient REST preparation failures")
 	flag.DurationVar(&cfg.ramp, "ramp", durationEnv("WT_LOAD_RAMP", 0), "ramp duration")
 	flag.DurationVar(&cfg.online, "online", durationEnv("WT_LOAD_ONLINE", time.Minute), "online duration")
 	flag.DurationVar(&cfg.editInterval, "edit-interval", durationEnv("WT_LOAD_EDIT_INTERVAL", 0), "per-session edit interval")
@@ -479,7 +503,7 @@ func parseConfig() (config, error) {
 	if cfg.apiURL == "" || *endpoints == "" || cfg.caFile == "" || cfg.password == "" {
 		return cfg, errors.New("api, endpoints, ca and password are required")
 	}
-	if cfg.clients < 1 || cfg.documents < 1 || cfg.prepareConcurrency < 1 || cfg.ramp < 0 || cfg.online <= 0 || cfg.editCount < 0 || cfg.editRetries < 0 || cfg.editInterval < 0 || cfg.connectRetries < 0 || cfg.resumeCount < 0 || cfg.resumeCount > cfg.clients || cfg.resumeDelay < 0 || cfg.resumeSettle < 0 {
+	if cfg.clients < 1 || cfg.documents < 1 || cfg.prepareConcurrency < 1 || cfg.prepareRetries < 0 || cfg.ramp < 0 || cfg.online <= 0 || cfg.editCount < 0 || cfg.editRetries < 0 || cfg.editInterval < 0 || cfg.connectRetries < 0 || cfg.resumeCount < 0 || cfg.resumeCount > cfg.clients || cfg.resumeDelay < 0 || cfg.resumeSettle < 0 {
 		return cfg, errors.New("invalid load configuration")
 	}
 	maxUsername := fmt.Sprintf("%s-user-%d-%s", cfg.prefix, cfg.clients-1, "000000000000")
