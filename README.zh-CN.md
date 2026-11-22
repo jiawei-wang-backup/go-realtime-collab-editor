@@ -172,6 +172,8 @@ Go 代码执行与协作数据链路完全分离：`Execution API → Runner →
 
 **原因与保证：** 生命周期状态只在短时间持有 Manager 锁时修改，etcd 与 Storage I/O 在锁外执行。进入 stopping 的 Room 不再处理新事件，在途 Edit 会完成或通过 Context 取消；后续客户端可以安全地重新创建并恢复 Room。
 
+每个节点对冷恢复设有上限。默认同时恢复 4 份不同文档，最多再排队 32 份，排队和恢复共用 10 秒。同一份文档的请求共享一次恢复，已经活跃的 Room 继续走正常编辑流程。
+
 ### 4.7 Snapshot + Replay
 
 **设计目的：** 在 Room 重建时恢复状态并限制内存 History。
@@ -239,6 +241,7 @@ Go 代码执行与协作数据链路完全分离：`Execution API → Runner →
 ```text
 cmd/service/                                              # 服务入口与依赖组装
 cmd/{admin,healthcheck,loadtest,migrate,quic-client,runner}/ # 其他独立命令入口
+cmd/webtransport-loadtest/                                # 轻量 WebTransport 容量与恢复测试客户端
 internal/app/                                             # Room 生命周期、认证和集群协调
 internal/domain/                                          # 文档、OT、权限和存储接口
 internal/adapter/                                         # MySQL、Redis、etcd、JWT、内存存储和 Runner 适配
@@ -398,6 +401,18 @@ go build ./...
 
 一次受控开发机测试覆盖了 1、3、5 节点拓扑，最高包含 15 个并发客户端和 300 次已应用 Edit，记录中没有 Edit 错误。该结果用于功能与工程验证，不代表生产容量或 SLA；完整环境与原始结果保留在 [Phase 8.9 压力测试](docs/performance/phase-8.9-load-test.md)。
 
+### 近期容量与故障恢复工作
+
+UTF-8 编辑在校验和应用时减少了临时内存分配，Room 冷恢复加上了每节点限制，权限刷新减少了 MySQL 往返，短时间内的在线成员列表更新会合并发送。打开 Room 时如果恰逢 Owner 切换，浏览器会话会重新确认归属，并可重定向到新节点。Prometheus 分开统计活跃 WebTransport 会话和原生 QUIC 连接。
+
+| 场景 | 实测结果 |
+| --- | --- |
+| Windows Chrome → Mac，局域网 WebTransport | 两轮独立的 2,000 会话容量测试通过。另测了 1,000 会话的 Owner 宕机，全部恢复，30 次编辑全部确认。 |
+| 轻量 Go WebTransport 客户端，同一台 Mac 上运行两个服务进程 | 一轮 5,000 会话 Owner 宕机测试中，5,000 个会话全部恢复，5,000 次编辑全部确认。 |
+| 轻量 Go WebTransport 客户端，同一台 Mac 上运行两个服务进程 | 10,000 个会话加入 200 份文档并跑完 30 分钟在线窗口，356 组满员采样均为 10,000。10,000 次编辑全部确认，ACK P95 为 42.1 ms，最终内容和版本符合预期。 |
+
+万人实测记录了 10 次初始建连重试，以及 197 次发生在客户端将对应会话标记为正在关闭之前的读取失败。汇总日志无法定位这些事件的具体时间。结果对应本轮负载和硬件，跨机器万人容量和生产 SLA 尚未验证。详见[万人在线实测报告](docs/performance/2026-11-22-webtransport-10k-acceptance.md)和[复测手册](docs/operations/webtransport-10k-runbook.md)。
+
 ## 9. 部署
 
 仓库包含多阶段 Dockerfile、非 Root 运行用户、Health Check、基于 Compose 的本地依赖，以及 Google Cloud Terraform。目标云架构使用三台 Compute Engine 应用节点、三节点 etcd、私网 Cloud SQL MySQL HA、Memorystore Redis、Secret Manager、Cloud NAT、内部 mTLS 和 Monitoring。Terraform 已完成 `fmt`、`validate` 和离线 `plan`，计划结果为 56 add / 0 change / 0 destroy。
@@ -455,6 +470,6 @@ terraform -chdir=deployments/gcp plan -refresh=false
 - 版本历史支持浏览和对比。恢复旧版本和多人协作时仅撤销自己的编辑尚未实现。
 - 第一版多节点部署采用稳定节点身份，不包含自动扩缩容、自动证书签发或健康 Room 主动迁移。
 - Google Cloud 尚未部署；Terraform 验证不能替代真实配额、IAM、证书、DNS 和网络验证。
-- Phase 8.9 是短时小规模测试，不代表生产峰值容量、跨区域延迟或长期内存稳定性。
+- 万人结果对应单台 Mac、两个服务进程、200 份文档和每会话一次编辑。跨区域延迟及长时间资源稳定性尚未验证。
 - 生产镜像已完成构建，并验证了非 Root 运行与 Health Check；外部镜像 CVE 扫描仍属于部署前必做项。
 - 仓库尚未选择公开分发 License。

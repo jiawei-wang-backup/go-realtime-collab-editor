@@ -288,8 +288,6 @@ MEMBERS=$(docker exec "$ETCD_CONTAINER" etcdctl --endpoints=https://127.0.0.1:23
 log 'ETCD MEMBERSHIP: 2'
 
 if [[ "$LAN_FIXTURE_MODE" == true ]]; then
-  OWNER_FAILOVER_CONTROL_PORT=$(random_port)
-  OWNER_FAILOVER_TOKEN=$(openssl rand -hex 24)
   WINDOWS_ENV_FILE="$TEMP_DIR/windows-env.ps1"
   cat > "$WINDOWS_ENV_FILE" <<EOF
 \$env:REST_A_URL='https://${LAN_MAC_IP}:${REST_A}'
@@ -298,9 +296,15 @@ if [[ "$LAN_FIXTURE_MODE" == true ]]; then
 \$env:WT_B_URL='https://${LAN_MAC_IP}:${WT_B}/api/webtransport'
 \$env:CAPACITY_PAGE_URL='https://${LAN_MAC_IP}:${VITE_A}/e2e/webtransport-capacity.html'
 \$env:WT_HASH='${WT_HASH}'
+EOF
+  if [[ "$OWNER_FAILOVER_DRILL" == true ]]; then
+    OWNER_FAILOVER_CONTROL_PORT=$(random_port)
+    OWNER_FAILOVER_TOKEN=$(openssl rand -hex 24)
+    cat >> "$WINDOWS_ENV_FILE" <<EOF
 \$env:FAILOVER_CONTROL_URL='http://${LAN_MAC_IP}:${OWNER_FAILOVER_CONTROL_PORT}'
 \$env:FAILOVER_CONTROL_TOKEN='${OWNER_FAILOVER_TOKEN}'
 EOF
+  fi
   chmod 600 "$WINDOWS_ENV_FILE"
   CA_SHA256=$(shasum -a 256 "$TEMP_DIR/lan-root-ca.pem" | awk '{print toupper($1)}')
   CA_SHA1=$("$OPENSSL3" x509 -in "$TEMP_DIR/lan-root-ca.pem" -noout -fingerprint -sha1 | cut -d= -f2 | tr -d ':')
@@ -343,15 +347,17 @@ PY
   sleep 0.2
   kill -0 "$!" 2>/dev/null || { log 'LAN DOWNLOAD SERVER: FAILED'; exit 1; }
 
-  python3 -u "$ROOT/scripts/owner-failover-control.py" \
-    --bind "$LAN_MAC_IP" \
-    --port "$OWNER_FAILOVER_CONTROL_PORT" \
-    --allowed-ip "$LAN_WINDOWS_IP" \
-    --token "$OWNER_FAILOVER_TOKEN" \
-    --owner-pid "$NODE_A_PID" >"$TEMP_DIR/owner-failover-control.log" 2>&1 &
-  PIDS+=("$!")
-  sleep 0.2
-  kill -0 "$!" 2>/dev/null || { log 'OWNER FAILOVER CONTROL: FAILED'; exit 1; }
+  if [[ "$OWNER_FAILOVER_DRILL" == true ]]; then
+    python3 -u "$ROOT/scripts/owner-failover-control.py" \
+      --bind "$LAN_MAC_IP" \
+      --port "$OWNER_FAILOVER_CONTROL_PORT" \
+      --allowed-ip "$LAN_WINDOWS_IP" \
+      --token "$OWNER_FAILOVER_TOKEN" \
+      --owner-pid "$NODE_A_PID" >"$TEMP_DIR/owner-failover-control.log" 2>&1 &
+    PIDS+=("$!")
+    sleep 0.2
+    kill -0 "$!" 2>/dev/null || { log 'OWNER FAILOVER CONTROL: FAILED'; exit 1; }
+  fi
 
   log 'LAN FIXTURE: READY'
   log "ROOT_CA_URL=http://${LAN_MAC_IP}:${CA_DOWNLOAD_PORT}/rootCA.pem"
@@ -359,11 +365,13 @@ PY
   log "ROOT_CA_SHA256=$CA_SHA256"
   log "ROOT_CA_SHA1=$CA_SHA1"
   log "CAPACITY_PAGE_URL=https://${LAN_MAC_IP}:${VITE_A}/e2e/webtransport-capacity.html"
-  log "OWNER_FAILOVER_READY_URL=http://${LAN_MAC_IP}:${OWNER_FAILOVER_CONTROL_PORT}/ready"
-  log "OWNER_FAILOVER_STATE_URL=http://${LAN_MAC_IP}:${OWNER_FAILOVER_CONTROL_PORT}/state"
-  log "OWNER_FAILOVER_TRIGGER_URL=http://${LAN_MAC_IP}:${OWNER_FAILOVER_CONTROL_PORT}/trigger"
-  log 'OWNER_FAILOVER_TOKEN=REDACTED (download from WINDOWS_ENV_URL)'
-  log "OWNER_FAILOVER_OWNER_PID=$NODE_A_PID"
+  if [[ "$OWNER_FAILOVER_DRILL" == true ]]; then
+    log "OWNER_FAILOVER_READY_URL=http://${LAN_MAC_IP}:${OWNER_FAILOVER_CONTROL_PORT}/ready"
+    log "OWNER_FAILOVER_STATE_URL=http://${LAN_MAC_IP}:${OWNER_FAILOVER_CONTROL_PORT}/state"
+    log "OWNER_FAILOVER_TRIGGER_URL=http://${LAN_MAC_IP}:${OWNER_FAILOVER_CONTROL_PORT}/trigger"
+    log 'OWNER_FAILOVER_TOKEN=REDACTED (download from WINDOWS_ENV_URL)'
+    log "OWNER_FAILOVER_OWNER_PID=$NODE_A_PID"
+  fi
   log "WINDOWS_LOAD_HOST=$LAN_WINDOWS_IP"
   log 'Press Ctrl+C on the Mac after the Windows run finishes.'
   while :; do
@@ -383,7 +391,7 @@ export E2E_NODE_A_RESTART_ENV="$TEMP_DIR/node-a2.env" E2E_NODE_B_RESTART_ENV="$T
 export E2E_SERVER_BINARY="$TEMP_DIR/collab-server" E2E_PROJECT_ROOT="$ROOT" E2E_ETCD_CONTAINER="$ETCD_CONTAINER" E2E_RESTART_PID_FILE="$TEMP_DIR/restart-pids"
 export E2E_BROWSER_CHANNEL=chrome
 
-if [[ -n ${WEBTRANSPORT_FAILOVER_MODE:-} && "$LAN_FIXTURE_MODE" != true ]]; then
+if [[ "${WEBTRANSPORT_FAILOVER_MODE:-false}" == true ]]; then
   LOCAL_CONTROL_PORT=$(random_port)
   LOCAL_CONTROL_TOKEN=$(openssl rand -hex 24)
   python3 -u "$ROOT/scripts/owner-failover-control.py" \

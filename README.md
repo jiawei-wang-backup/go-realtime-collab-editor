@@ -172,6 +172,8 @@ Go execution is deliberately outside the collaboration data path: `Execution API
 
 **Rationale and guarantees:** Lifecycle state is changed under short manager critical sections while etcd and storage I/O run outside the lock. A stopping Room cannot process new events, an in-flight edit completes or is cancelled through context, and a later client can safely create and recover a new Room.
 
+Cold recovery is bounded per node. By default, up to four distinct documents recover concurrently, with up to 32 queued and a shared 10-second queue-and-recovery deadline. Requests for the same document share the recovery, and already active Rooms stay on the normal edit path.
+
 ### 4.7 Snapshot + Replay
 
 **Purpose:** Recover Room state while bounding in-memory history.
@@ -239,6 +241,7 @@ Versions below are read from the current repository configuration.
 ```text
 cmd/service/                                              # Server entry point and dependency wiring
 cmd/{admin,healthcheck,loadtest,migrate,quic-client,runner}/ # Other executable entry points
+cmd/webtransport-loadtest/                                # Lightweight WebTransport capacity and recovery client
 internal/app/                                             # Room lifecycle, authentication, and cluster coordination
 internal/domain/                                          # Document, OT, permission, and storage contracts
 internal/adapter/                                         # MySQL, Redis, etcd, JWT, in-memory storage, and Runner adapters
@@ -398,6 +401,18 @@ go build ./...
 
 A controlled development-machine run exercised 1-, 3-, and 5-node topologies, up to 15 concurrent clients and 300 applied edits, with no edit errors in the recorded run. This is functional and engineering validation rather than a production capacity or SLA claim. The complete environment and raw results remain in the [Phase 8.9 Load Test](docs/performance/phase-8.9-load-test.md).
 
+### Recent Capacity and Recovery Work
+
+The edit path reduces temporary allocations when validating and applying UTF-8 edits. Room recovery is bounded per node, permission refresh uses fewer MySQL round trips, and short bursts of participant-list updates are coalesced. If a Room open races with an Owner change, the browser session checks ownership again and can redirect to the new node. Prometheus tracks active WebTransport sessions separately from native QUIC connections.
+
+| Scenario | Observed result |
+| --- | --- |
+| Windows Chrome → Mac, WebTransport over a LAN | Two independent 2,000-session capacity runs passed. A separate 1,000-session Owner failover run recovered all sessions and confirmed all 30 edits. |
+| Lightweight Go WebTransport client, two service processes on one Mac | In a 5,000-session Owner failover run, all 5,000 sessions resumed and all 5,000 edits were confirmed. |
+| Lightweight Go WebTransport client, two service processes on one Mac | 10,000 sessions joined 200 documents and completed a 30-minute online window. All 356 full-capacity samples recorded 10,000 sessions. All 10,000 edits were acknowledged, with a 42.1 ms ACK P95 and matching final content and versions. |
+
+The 10,000-session run recorded 10 initial join retries and 197 read failures before the client marked the corresponding sessions as closing. The aggregate log does not locate those events in time. These measurements describe the tested workload and hardware. Cross-machine 10,000-session capacity and production SLA targets remain unverified. See the [10,000-session report](docs/performance/2026-11-22-webtransport-10k-acceptance.md) and [reproduction guide](docs/operations/webtransport-10k-runbook.md).
+
 ## 9. Deployment
 
 The repository includes a multi-stage Dockerfile, a non-root runtime user, health checks, Compose-based local dependencies, and Google Cloud Terraform. The target cloud architecture uses three Compute Engine application nodes, a three-member etcd cluster, private Cloud SQL MySQL HA, Memorystore Redis, Secret Manager, Cloud NAT, internal mTLS, and Monitoring. Terraform has passed `fmt`, `validate`, and an offline `plan` with 56 additions, 0 changes, and 0 deletions.
@@ -455,6 +470,6 @@ Do not apply without an approved plan, budget, and rollback procedure.
 - Version history supports browsing and comparison. Restoring a historical version and undoing only your own edits during a shared session are not implemented.
 - The initial multi-node deployment assumes stable node identities; it does not automate scaling, certificate issuance, or proactive migration of healthy Rooms.
 - Google Cloud has not been deployed. Terraform validation cannot replace real quota, IAM, certificate, DNS, and network verification.
-- Phase 8.9 was a short, small-scale test and does not establish production peak capacity, cross-region latency, or long-term memory stability.
+- The 10,000-session result covers one Mac, two service processes, 200 documents, and one edit per session. Cross-region latency and long-duration resource stability remain unverified.
 - The production image was built and its non-root runtime and health check were verified; an external image CVE scan remains a deployment-time requirement.
 - The repository does not yet declare a public-distribution license.
