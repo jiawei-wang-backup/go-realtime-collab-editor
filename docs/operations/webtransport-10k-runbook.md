@@ -82,6 +82,8 @@ Mac Owner Failover smoke 已完成：在 `OWNER_FAILOVER_DRILL=true` fixture 中
 
 256 会话已完成两轮诊断：第一轮在 JOIN 阶段触发故障，`resume_success=256/256`、收敛通过，但有 17 次意外断线且 JOIN P95 被故障拉高至 5.065s；第二轮在 JOIN 全部完成后触发，`resume_success=256/256`、收敛通过，但 node-b ownership handoff 与在线编辑重叠导致 `edit_failures=107/256`、`unexpected_disconnects=131`。因此 256 目前只能作为恢复路径证据，不能作为无故障稳定性通过。客户端新增 `resume-settle` 参数，下一轮会在恢复后等待 ownership 稳定再发 EDIT。
 
+1,000 会话试验已完成恢复路径验证：`resume_attempts=1000`、`resume_success=1000`、`resume_failures=0`、收敛通过；但只完成编辑 485/1000，`edit_failures=515`、`unexpected_disconnects=513`，即使 `resume-settle=10s` 仍不足以宣称 Failover 稳定。JOIN P95 22.945ms，编辑 ACK P95 26.707ms。下一步必须继续增加接管稳定等待并区分计划内旧连接关闭与真正恢复失败，不能直接推进 5,000 Failover 或 10,000。
+
 5,000 重试稳定后对 Go Failover 可测性的评估：
 
 - 现有 Go 客户端没有保存 session token/doc version 后重新建立 WebTransport 会话的状态机，因此不能直接测量 Owner 失效后的自动 `RESUME`。
