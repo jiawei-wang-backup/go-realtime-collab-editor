@@ -86,6 +86,8 @@ Mac Owner Failover smoke 已完成：在 `OWNER_FAILOVER_DRILL=true` fixture 中
 
 5,000 Failover 复测尚未进入 WebTransport JOIN：准备并发 1 的运行持续约 27 分钟仍停留在 REST 准备阶段，已取消；准备并发 4、租约 30s 的重跑在用户 1,113 的权限授予阶段返回 500，也已取消。客户端现加入 `prepare-retries`（默认 1 次退避），下一轮需先验证准备阶段可重复完成，再触发 5,000 Owner Failover。带 `prepare-retries=2` 的重跑已将准备耗时降至约 381s，并完成 4,999/5,000 JOIN；唯一失败为 `owner redirect loop`，尚未进入 Failover。`connect-retries` 现已扩展到 owner redirect loop 和 handoff 错误，下一轮可直接重跑最后 1 个边界失败。
 
+最终 5,000 Owner Failover 复测已完成：准备并发 4、准备重试 2、JOIN 重试 2，准备 413.959s；`join_success=5000/5000`、`resume_attempts=5000`、`resume_success=5000`、`resume_failures=0`、`resync_count=0`，编辑 `5000/5000`、`edit_failures=0`，内容/版本收敛通过。Owner Redirect 2,475 次，JOIN P95 132.444ms，编辑 ACK P95 27.04ms，`unexpected_disconnects=806`（node-a 被终止时旧连接关闭的累计观测，不能当作恢复失败）。该轮证明了 Mac 5,000 会话 Owner Failover 后的 RESUME/SYNC 和编辑收敛；尚未证明真实 RESYNC_REQUIRED，也不把 806 个旧连接关闭当作零断线稳定性。
+
 5,000 重试稳定后对 Go Failover 可测性的评估：
 
 - 现有 Go 客户端没有保存 session token/doc version 后重新建立 WebTransport 会话的状态机，因此不能直接测量 Owner 失效后的自动 `RESUME`。
