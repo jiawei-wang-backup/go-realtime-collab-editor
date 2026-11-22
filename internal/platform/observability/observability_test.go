@@ -49,6 +49,26 @@ func TestLoggerRedactsSecretsAndDocumentContent(t *testing.T) {
 	}
 }
 
+func TestWebTransportSessionMetricTracksLifecycle(t *testing.T) {
+	metrics := NewMetrics()
+	metrics.WebTransportSessionOpened()
+	metrics.WebTransportSessionOpened()
+	metrics.WebTransportSessionClosed()
+	families, err := metrics.registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, family := range families {
+		if family.GetName() == "collab_webtransport_sessions_active" {
+			if got := family.Metric[0].GetGauge().GetValue(); got != 1 {
+				t.Fatalf("active WebTransport sessions = %v, want 1", got)
+			}
+			return
+		}
+	}
+	t.Fatal("missing WebTransport session metric")
+}
+
 func TestMetricsUseOnlyBoundedLabelsAndInstrumentHTTP(t *testing.T) {
 	metrics := NewMetrics()
 	handler := metrics.InstrumentHTTP("public", http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {

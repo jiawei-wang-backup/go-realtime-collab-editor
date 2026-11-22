@@ -23,6 +23,11 @@ import (
 
 const Path = "/api/webtransport"
 
+type SessionObserver interface {
+	WebTransportSessionOpened()
+	WebTransportSessionClosed()
+}
+
 type Config struct {
 	Address        string
 	TLSConfig      *tls.Config
@@ -31,6 +36,7 @@ type Config struct {
 	StreamTimeout  time.Duration
 	IdleTimeout    time.Duration
 	MaxMessageSize uint32
+	Observer       SessionObserver
 }
 
 type Server struct {
@@ -141,7 +147,13 @@ func (server *Server) handle(writer http.ResponseWriter, request *http.Request) 
 	}
 	server.sessions[session] = struct{}{}
 	server.mu.Unlock()
+	if server.config.Observer != nil {
+		server.config.Observer.WebTransportSessionOpened()
+	}
 	defer func() {
+		if server.config.Observer != nil {
+			server.config.Observer.WebTransportSessionClosed()
+		}
 		server.mu.Lock()
 		delete(server.sessions, session)
 		server.mu.Unlock()

@@ -30,6 +30,7 @@ type Metrics struct {
 	RecoveryDuration     prometheus.Histogram
 	QUICConnections      prometheus.Gauge
 	QUICConnectionsTotal prometheus.Counter
+	WebTransportSessions prometheus.Gauge
 	QUICEvents           *prometheus.CounterVec
 	RedisOperations      *prometheus.HistogramVec
 	RedisEvents          *prometheus.CounterVec
@@ -53,8 +54,9 @@ func NewMetrics() *Metrics {
 	metrics.SnapshotOperations = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "collab_snapshot_operations_total", Help: "Snapshot operations by bounded result."}, []string{"result"})
 	metrics.ReplayDuration = durationHistogram("collab_replay_duration_seconds", "Snapshot and operation replay duration.")
 	metrics.RecoveryDuration = durationHistogram("collab_recovery_duration_seconds", "Ownership recovery duration.")
-	metrics.QUICConnections = prometheus.NewGauge(prometheus.GaugeOpts{Name: "collab_quic_connections_active", Help: "Active QUIC connections."})
-	metrics.QUICConnectionsTotal = prometheus.NewCounter(prometheus.CounterOpts{Name: "collab_quic_connections_total", Help: "Accepted QUIC connections."})
+	metrics.QUICConnections = prometheus.NewGauge(prometheus.GaugeOpts{Name: "collab_quic_connections_active", Help: "Active native QUIC connections."})
+	metrics.QUICConnectionsTotal = prometheus.NewCounter(prometheus.CounterOpts{Name: "collab_quic_connections_total", Help: "Accepted native QUIC connections."})
+	metrics.WebTransportSessions = prometheus.NewGauge(prometheus.GaugeOpts{Name: "collab_webtransport_sessions_active", Help: "Active WebTransport sessions."})
 	metrics.QUICEvents = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "collab_quic_events_total", Help: "QUIC events by bounded event and result."}, []string{"event", "result"})
 	metrics.RedisOperations = prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "collab_redis_operation_duration_seconds", Help: "Redis operation duration by bounded operation.", Buckets: prometheus.DefBuckets}, []string{"operation"})
 	metrics.RedisEvents = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "collab_redis_events_total", Help: "Redis coordination events by bounded event and result."}, []string{"event", "result"})
@@ -68,7 +70,7 @@ func NewMetrics() *Metrics {
 		metrics.MembershipNodes, metrics.NodeReady, metrics.LeaseRenewalFailures, metrics.OwnershipAttempts,
 		metrics.ActiveRooms, metrics.ActiveClients, metrics.RoomQueueDepth, metrics.SlowClients,
 		metrics.SnapshotOperations, metrics.ReplayDuration, metrics.RecoveryDuration,
-		metrics.QUICConnections, metrics.QUICConnectionsTotal, metrics.QUICEvents, metrics.RedisOperations, metrics.RedisEvents, metrics.PresenceHeartbeats,
+		metrics.QUICConnections, metrics.QUICConnectionsTotal, metrics.WebTransportSessions, metrics.QUICEvents, metrics.RedisOperations, metrics.RedisEvents, metrics.PresenceHeartbeats,
 		metrics.MySQLOperations, metrics.MySQLFailures, metrics.MySQLPool, metrics.HTTPRequestDuration,
 	)
 	return metrics
@@ -88,6 +90,10 @@ func (metrics *Metrics) QUICConnectionOpened() {
 }
 
 func (metrics *Metrics) QUICConnectionClosed() { metrics.QUICConnections.Dec() }
+
+func (metrics *Metrics) WebTransportSessionOpened() { metrics.WebTransportSessions.Inc() }
+
+func (metrics *Metrics) WebTransportSessionClosed() { metrics.WebTransportSessions.Dec() }
 
 func (metrics *Metrics) QUICEvent(event, result string) {
 	metrics.QUICEvents.WithLabelValues(event, result).Inc()
