@@ -70,6 +70,7 @@ type report struct {
 	Edits                         int64             `json:"edits"`
 	EditFailures                  int64             `json:"edit_failures"`
 	EditRetries                   int               `json:"edit_retries"`
+	EditErrorSamples              map[string]int    `json:"edit_error_samples,omitempty"`
 	RemoteUpdates                 int64             `json:"remote_updates"`
 	MaxObservedVersion            uint64            `json:"max_observed_version"`
 	ConvergenceOK                 bool              `json:"convergence_ok"`
@@ -274,9 +275,10 @@ func run() error {
 
 	var joinLatencies []time.Duration
 	var editLatencies []time.Duration
-	var joinMu, editMu, joinErrorMu sync.Mutex
+	var joinMu, editMu, joinErrorMu, editErrorMu sync.Mutex
 	joinErrorSamples := make(map[string]int)
 	resumeErrorSamples := make(map[string]int)
+	editErrorSamples := make(map[string]int)
 	var joins, joinFailures, joinRetries, redirects, edits, editFailures, remoteUpdates, disconnects atomic.Int64
 	var resumeAttempts, resumeSuccess, resumeFailures, resyncCount atomic.Int64
 	var maxObservedVersion atomic.Uint64
@@ -313,7 +315,7 @@ func run() error {
 	}
 
 	if len(sessions) != cfg.clients {
-		report := report{Clients: cfg.clients, Documents: cfg.documents, PreparationConcurrency: cfg.prepareConcurrency, PreparationSeconds: prepSeconds, EditRetries: cfg.editRetries, JoinSuccess: joins.Load(), JoinFailures: joinFailures.Load(), JoinRetries: joinRetries.Load(), ResumeErrorSamples: resumeErrorSamples, JoinErrorSamples: joinErrorSamples, Redirects: redirects.Load(), LogicalSessions: len(sessions), TransportInstances: len(sessions), UnderlyingConnectionsMeasured: false}
+		report := report{Clients: cfg.clients, Documents: cfg.documents, PreparationConcurrency: cfg.prepareConcurrency, PreparationSeconds: prepSeconds, EditRetries: cfg.editRetries, EditErrorSamples: editErrorSamples, JoinSuccess: joins.Load(), JoinFailures: joinFailures.Load(), JoinRetries: joinRetries.Load(), ResumeErrorSamples: resumeErrorSamples, JoinErrorSamples: joinErrorSamples, Redirects: redirects.Load(), LogicalSessions: len(sessions), TransportInstances: len(sessions), UnderlyingConnectionsMeasured: false}
 		closeSessions(sessions)
 		return emitReport(report, fmt.Errorf("join incomplete: success=%d target=%d", len(sessions), cfg.clients))
 	}
@@ -358,7 +360,7 @@ func run() error {
 		go resumed.receive(&disconnects, &remoteUpdates, &maxObservedVersion, tracker)
 	}
 
-	report := report{Clients: cfg.clients, Documents: cfg.documents, PreparationConcurrency: cfg.prepareConcurrency, PreparationSeconds: prepSeconds, EditRetries: cfg.editRetries, JoinSuccess: joins.Load(), JoinFailures: joinFailures.Load(), JoinRetries: joinRetries.Load(), ResumeAttempts: resumeAttempts.Load(), ResumeSuccess: resumeSuccess.Load(), ResumeFailures: resumeFailures.Load(), ResyncCount: resyncCount.Load(), ResumeErrorSamples: resumeErrorSamples, JoinErrorSamples: joinErrorSamples, Redirects: redirects.Load(), LogicalSessions: len(sessions), TransportInstances: len(sessions), UnderlyingConnectionsMeasured: false}
+	report := report{Clients: cfg.clients, Documents: cfg.documents, PreparationConcurrency: cfg.prepareConcurrency, PreparationSeconds: prepSeconds, EditRetries: cfg.editRetries, EditErrorSamples: editErrorSamples, JoinSuccess: joins.Load(), JoinFailures: joinFailures.Load(), JoinRetries: joinRetries.Load(), ResumeAttempts: resumeAttempts.Load(), ResumeSuccess: resumeSuccess.Load(), ResumeFailures: resumeFailures.Load(), ResyncCount: resyncCount.Load(), ResumeErrorSamples: resumeErrorSamples, JoinErrorSamples: joinErrorSamples, Redirects: redirects.Load(), LogicalSessions: len(sessions), TransportInstances: len(sessions), UnderlyingConnectionsMeasured: false}
 	if resumeFailures.Load() > 0 {
 		closeSessions(sessions)
 		return emitReport(report, fmt.Errorf("resume incomplete: success=%d target=%d", resumeSuccess.Load(), resumeAttempts.Load()))
@@ -428,7 +430,12 @@ func run() error {
 						editMu.Unlock()
 						edits.Add(1)
 						succeeded = true
-					case <-ack.err:
+					case editErr := <-ack.err:
+						editErrorMu.Lock()
+						if len(editErrorSamples) < 5 {
+							editErrorSamples[editErr.Error()]++
+						}
+						editErrorMu.Unlock()
 						current.acks.Delete(requestID)
 						time.Sleep(250 * time.Millisecond)
 					case <-time.After(10 * time.Second):
