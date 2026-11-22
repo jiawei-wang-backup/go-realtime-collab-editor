@@ -561,13 +561,13 @@ func connectWithRetry(ctx context.Context, cfg config, token, docID string) (*se
 			return current, redirects, attempt, nil
 		}
 		lastErr = err
-		if !strings.HasPrefix(err.Error(), "webtransport dial ") || attempt == cfg.connectRetries {
+		if attempt == cfg.connectRetries {
 			break
 		}
 		select {
 		case <-ctx.Done():
 			return nil, redirects, attempt, ctx.Err()
-		case <-time.After(100 * time.Millisecond):
+		case <-time.After(time.Duration(attempt+1) * 100 * time.Millisecond):
 			retries++
 		}
 	}
