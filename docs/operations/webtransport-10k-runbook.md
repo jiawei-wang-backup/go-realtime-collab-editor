@@ -74,6 +74,8 @@ Mac 本地轻量客户端基线：
 
 - Go 轻量客户端的 Owner Failover 后自动重连和 `RESUME`/`SYNC`/`RESYNC` 完整状态机；当前只具备 AUTH/JOIN/Owner Redirect/EDIT/ACK 和内容收敛验证，Failover 仍以既有 Chrome harness 结果为基线。
 
+Mac Go RESUME smoke 已完成：2 个会话、1 个文档各先 JOIN，再执行一次计划内断线重连；`resume-count=2`，结果为 `resume_attempts=2`、`resume_success=2`、`resume_failures=0`、`resync_count=0`，随后编辑 2/2、内容/版本收敛通过、意外断线 0。该 smoke 验证了真实 WebTransport `AUTH → RESUME → SYNC → EDIT` 路径；尚未覆盖 Owner 进程失效触发的 `RESYNC_REQUIRED`。
+
 5,000 重试稳定后对 Go Failover 可测性的评估：
 
 - 现有 Go 客户端没有保存 session token/doc version 后重新建立 WebTransport 会话的状态机，因此不能直接测量 Owner 失效后的自动 `RESUME`。

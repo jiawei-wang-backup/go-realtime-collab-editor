@@ -46,6 +46,7 @@ type config struct {
 	connectRetries     int
 	password           string
 	prefix             string
+	resumeCount        int
 }
 
 type report struct {
@@ -56,6 +57,10 @@ type report struct {
 	JoinSuccess                   int64             `json:"join_success"`
 	JoinFailures                  int64             `json:"join_failures"`
 	JoinRetries                   int64             `json:"join_retries"`
+	ResumeAttempts                int64             `json:"resume_attempts"`
+	ResumeSuccess                 int64             `json:"resume_success"`
+	ResumeFailures                int64             `json:"resume_failures"`
+	ResyncCount                   int64             `json:"resync_count"`
 	JoinErrorSamples              map[string]int    `json:"join_error_samples,omitempty"`
 	Redirects                     int64             `json:"redirects"`
 	Edits                         int64             `json:"edits"`
@@ -78,15 +83,19 @@ type report struct {
 }
 
 type session struct {
-	transport *webtransportgo.Transport
-	session   *webtransportgo.Session
-	stream    *webtransportgo.Stream
-	docID     string
-	version   atomic.Uint64
-	acks      sync.Map
-	done      chan struct{}
-	closing   atomic.Bool
-	err       atomic.Value
+	transport    *webtransportgo.Transport
+	session      *webtransportgo.Session
+	stream       *webtransportgo.Stream
+	token        string
+	docID        string
+	version      atomic.Uint64
+	resumeResync atomic.Bool
+	contentMu    sync.Mutex
+	content      string
+	acks         sync.Map
+	done         chan struct{}
+	closing      atomic.Bool
+	err          atomic.Value
 }
 
 type pendingAck struct{ done chan struct{} }
@@ -260,6 +269,7 @@ func run() error {
 	var joinMu, editMu, joinErrorMu sync.Mutex
 	joinErrorSamples := make(map[string]int)
 	var joins, joinFailures, joinRetries, redirects, edits, editFailures, remoteUpdates, disconnects atomic.Int64
+	var resumeAttempts, resumeSuccess, resumeFailures, resyncCount atomic.Int64
 	var maxObservedVersion atomic.Uint64
 	tracker := newConvergenceTracker(docs)
 	sessions := make([]*session, 0, cfg.clients)
@@ -293,10 +303,42 @@ func run() error {
 		}
 	}
 
-	report := report{Clients: cfg.clients, Documents: cfg.documents, PreparationConcurrency: cfg.prepareConcurrency, PreparationSeconds: prepSeconds, JoinSuccess: joins.Load(), JoinFailures: joinFailures.Load(), JoinRetries: joinRetries.Load(), JoinErrorSamples: joinErrorSamples, Redirects: redirects.Load(), LogicalSessions: len(sessions), TransportInstances: len(sessions), UnderlyingConnectionsMeasured: false}
 	if len(sessions) != cfg.clients {
+		report := report{Clients: cfg.clients, Documents: cfg.documents, PreparationConcurrency: cfg.prepareConcurrency, PreparationSeconds: prepSeconds, JoinSuccess: joins.Load(), JoinFailures: joinFailures.Load(), JoinRetries: joinRetries.Load(), JoinErrorSamples: joinErrorSamples, Redirects: redirects.Load(), LogicalSessions: len(sessions), TransportInstances: len(sessions), UnderlyingConnectionsMeasured: false}
 		closeSessions(sessions)
 		return emitReport(report, fmt.Errorf("join incomplete: success=%d target=%d", len(sessions), cfg.clients))
+	}
+	for i := 0; i < cfg.resumeCount; i++ {
+		resumeAttempts.Add(1)
+		old := sessions[i]
+		lastVersion := old.version.Load()
+		old.contentMu.Lock()
+		lastContent := old.content
+		old.contentMu.Unlock()
+		old.close()
+		select {
+		case <-old.done:
+		case <-ctx.Done():
+			resumeFailures.Add(1)
+			continue
+		}
+		resumed, _, resynced, err := resume(ctx, cfg, old.token, old.docID, lastVersion, lastContent)
+		if err != nil {
+			resumeFailures.Add(1)
+			continue
+		}
+		if resynced {
+			resyncCount.Add(1)
+		}
+		resumeSuccess.Add(1)
+		sessions[i] = resumed
+		go resumed.receive(&disconnects, &remoteUpdates, &maxObservedVersion, tracker)
+	}
+
+	report := report{Clients: cfg.clients, Documents: cfg.documents, PreparationConcurrency: cfg.prepareConcurrency, PreparationSeconds: prepSeconds, JoinSuccess: joins.Load(), JoinFailures: joinFailures.Load(), JoinRetries: joinRetries.Load(), ResumeAttempts: resumeAttempts.Load(), ResumeSuccess: resumeSuccess.Load(), ResumeFailures: resumeFailures.Load(), ResyncCount: resyncCount.Load(), JoinErrorSamples: joinErrorSamples, Redirects: redirects.Load(), LogicalSessions: len(sessions), TransportInstances: len(sessions), UnderlyingConnectionsMeasured: false}
+	if resumeFailures.Load() > 0 {
+		closeSessions(sessions)
+		return emitReport(report, fmt.Errorf("resume incomplete: success=%d target=%d", resumeSuccess.Load(), resumeAttempts.Load()))
 	}
 
 	start := time.Now()
@@ -380,11 +422,12 @@ func parseConfig() (config, error) {
 	flag.IntVar(&cfg.connectRetries, "connect-retries", intEnv("WT_LOAD_CONNECT_RETRIES", 0), "retries after WebTransport Dial failures")
 	flag.StringVar(&cfg.password, "password", os.Getenv("WT_LOAD_PASSWORD"), "test password")
 	flag.StringVar(&cfg.prefix, "prefix", envOr("WT_LOAD_PREFIX", "wt-load"), "account prefix")
+	flag.IntVar(&cfg.resumeCount, "resume-count", intEnv("WT_LOAD_RESUME_COUNT", 0), "sessions to reconnect with RESUME before online edits")
 	flag.Parse()
 	if cfg.apiURL == "" || *endpoints == "" || cfg.caFile == "" || cfg.password == "" {
 		return cfg, errors.New("api, endpoints, ca and password are required")
 	}
-	if cfg.clients < 1 || cfg.documents < 1 || cfg.prepareConcurrency < 1 || cfg.ramp < 0 || cfg.online <= 0 || cfg.editCount < 0 || cfg.editInterval < 0 || cfg.connectRetries < 0 {
+	if cfg.clients < 1 || cfg.documents < 1 || cfg.prepareConcurrency < 1 || cfg.ramp < 0 || cfg.online <= 0 || cfg.editCount < 0 || cfg.editInterval < 0 || cfg.connectRetries < 0 || cfg.resumeCount < 0 || cfg.resumeCount > cfg.clients {
 		return cfg, errors.New("invalid load configuration")
 	}
 	maxUsername := fmt.Sprintf("%s-user-%d-%s", cfg.prefix, cfg.clients-1, "000000000000")
@@ -456,6 +499,18 @@ func connectWithRetry(ctx context.Context, cfg config, token, docID string) (*se
 }
 
 func connect(ctx context.Context, cfg config, token, docID string) (*session, int, error) {
+	return connectMode(ctx, cfg, token, docID, protocol.TypeJoin, 0, "")
+}
+
+func resume(ctx context.Context, cfg config, token, docID string, lastVersion uint64, content string) (*session, int, bool, error) {
+	current, redirects, err := connectMode(ctx, cfg, token, docID, protocol.TypeResume, lastVersion, content)
+	if err != nil {
+		return nil, redirects, false, err
+	}
+	return current, redirects, current.resumeResync.Load(), nil
+}
+
+func connectMode(ctx context.Context, cfg config, token, docID, messageType string, lastVersion uint64, content string) (*session, int, error) {
 	visited := map[string]struct{}{}
 	endpoint := cfg.endpoints[0]
 	for redirects := 0; redirects <= len(cfg.endpoints)+1; redirects++ {
@@ -475,7 +530,7 @@ func connect(ctx context.Context, cfg config, token, docID string) (*session, in
 			_ = transport.Close()
 			return nil, redirects, fmt.Errorf("open WebTransport stream: %w", err)
 		}
-		current := &session{transport: transport, session: wtSession, stream: stream, docID: docID, done: make(chan struct{})}
+		current := &session{transport: transport, session: wtSession, stream: stream, token: token, docID: docID, content: content, done: make(chan struct{})}
 		if err := current.write(protocol.Message{Type: protocol.TypeAuth, Token: token}); err != nil {
 			current.close()
 			return nil, redirects, fmt.Errorf("AUTH write: %w", err)
@@ -489,20 +544,17 @@ func connect(ctx context.Context, cfg config, token, docID string) (*session, in
 			current.close()
 			return nil, redirects, fmt.Errorf("unexpected AUTH response %s", message.Type)
 		}
-		if err := current.write(protocol.Message{Type: protocol.TypeJoin, DocID: docID}); err != nil {
+		request := protocol.Message{Type: messageType, DocID: docID, LastVersion: lastVersion}
+		if err := current.write(request); err != nil {
 			current.close()
-			return nil, redirects, fmt.Errorf("JOIN write: %w", err)
+			return nil, redirects, fmt.Errorf("%s write: %w", strings.ToUpper(messageType), err)
 		}
 		message, err = current.read()
 		if err != nil {
 			current.close()
-			return nil, redirects, fmt.Errorf("JOIN read: %w", err)
+			return nil, redirects, fmt.Errorf("%s read: %w", strings.ToUpper(messageType), err)
 		}
-		switch message.Type {
-		case protocol.TypeJoined:
-			current.version.Store(message.Version)
-			return current, redirects, nil
-		case protocol.TypeOwnerRedirect:
+		if message.Type == protocol.TypeOwnerRedirect {
 			current.close()
 			if message.Endpoint == "" {
 				return nil, redirects, errors.New("owner redirect without endpoint")
@@ -511,12 +563,67 @@ func connect(ctx context.Context, cfg config, token, docID string) (*session, in
 			if err != nil {
 				return nil, redirects, err
 			}
+			continue
+		}
+		switch {
+		case messageType == protocol.TypeJoin && message.Type == protocol.TypeJoined:
+			current.content = message.Content
+			current.version.Store(message.Version)
+			return current, redirects, nil
+		case messageType == protocol.TypeResume && (message.Type == protocol.TypeSync || message.Type == protocol.TypeResyncRequired):
+			if err := applyRecoveryMessage(current, message, lastVersion); err != nil {
+				current.close()
+				return nil, redirects, err
+			}
+			return current, redirects, nil
 		default:
 			current.close()
-			return nil, redirects, fmt.Errorf("unexpected JOIN response %s", message.Type)
+			return nil, redirects, fmt.Errorf("unexpected %s response %s", strings.ToUpper(messageType), message.Type)
 		}
 	}
 	return nil, len(cfg.endpoints) + 1, errors.New("too many owner redirects")
+}
+
+func applyRecoveryMessage(s *session, message protocol.Message, lastVersion uint64) error {
+	if message.DocID != s.docID {
+		return fmt.Errorf("recovery doc mismatch: got %s want %s", message.DocID, s.docID)
+	}
+	s.contentMu.Lock()
+	defer s.contentMu.Unlock()
+	content := s.content
+	version := lastVersion
+	if message.Type == protocol.TypeResyncRequired {
+		if message.Snapshot == nil || message.Snapshot.Version > message.CurrentVersion {
+			return errors.New("invalid RESYNC snapshot")
+		}
+		content = message.Snapshot.Content
+		version = message.Snapshot.Version
+		s.resumeResync.Store(true)
+	}
+	if message.Type == protocol.TypeSync && message.FromVersion != lastVersion {
+		return fmt.Errorf("SYNC from_version %d does not match local version %d", message.FromVersion, lastVersion)
+	}
+	for _, operation := range message.Operations {
+		if operation.Version != version+1 {
+			return fmt.Errorf("recovery operation version %d is not contiguous after %d", operation.Version, version)
+		}
+		var err error
+		content, err = collab.Apply(content, operation.Operation)
+		if err != nil {
+			return fmt.Errorf("apply recovery operation %d: %w", operation.Version, err)
+		}
+		version = operation.Version
+	}
+	if message.Type == protocol.TypeSync {
+		if version != message.ToVersion {
+			return fmt.Errorf("SYNC ended at version %d want %d", version, message.ToVersion)
+		}
+	} else if version != message.CurrentVersion {
+		return fmt.Errorf("RESYNC ended at version %d want %d", version, message.CurrentVersion)
+	}
+	s.content = content
+	s.version.Store(version)
+	return nil
 }
 
 func (s *session) receive(disconnects, remoteUpdates *atomic.Int64, maxObservedVersion *atomic.Uint64, tracker *convergenceTracker) {
@@ -532,6 +639,17 @@ func (s *session) receive(disconnects, remoteUpdates *atomic.Int64, maxObservedV
 		}
 		if message.Type == protocol.TypeEditApplied {
 			tracker.record(message)
+			if message.Operation != nil {
+				s.contentMu.Lock()
+				content, applyErr := collab.Apply(s.content, *message.Operation)
+				if applyErr != nil {
+					s.contentMu.Unlock()
+					s.err.Store(applyErr)
+					return
+				}
+				s.content = content
+				s.contentMu.Unlock()
+			}
 			s.version.Store(message.Version)
 			for {
 				observed := maxObservedVersion.Load()
