@@ -341,7 +341,7 @@ func run() error {
 			resumeFailures.Add(1)
 			continue
 		}
-		resumed, resumeRedirects, resynced, err := resume(ctx, cfg, old.token, old.docID, lastVersion, lastContent)
+		resumed, resumeRedirects, resynced, _, err := resumeWithRetry(ctx, cfg, old.token, old.docID, lastVersion, lastContent)
 		if err != nil {
 			resumeFailures.Add(1)
 			if len(resumeErrorSamples) < 5 {
@@ -560,6 +560,26 @@ func resume(ctx context.Context, cfg config, token, docID string, lastVersion ui
 		return nil, redirects, false, err
 	}
 	return current, redirects, current.resumeResync.Load(), nil
+}
+
+func resumeWithRetry(ctx context.Context, cfg config, token, docID string, lastVersion uint64, content string) (*session, int, bool, int, error) {
+	var redirects int
+	for attempt := 0; attempt <= cfg.connectRetries; attempt++ {
+		current, count, resynced, err := resume(ctx, cfg, token, docID, lastVersion, content)
+		redirects += count
+		if err == nil {
+			return current, redirects, resynced, attempt, nil
+		}
+		if attempt == cfg.connectRetries {
+			return nil, redirects, false, attempt, err
+		}
+		select {
+		case <-ctx.Done():
+			return nil, redirects, false, attempt, ctx.Err()
+		case <-time.After(time.Duration(attempt+1) * 500 * time.Millisecond):
+		}
+	}
+	return nil, redirects, false, cfg.connectRetries, errors.New("resume retry loop exhausted")
 }
 
 func connectMode(ctx context.Context, cfg config, token, docID, messageType string, lastVersion uint64, content string) (*session, int, error) {
