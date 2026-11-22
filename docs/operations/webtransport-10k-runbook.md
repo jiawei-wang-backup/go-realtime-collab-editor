@@ -84,7 +84,7 @@ Mac Owner Failover smoke 已完成：在 `OWNER_FAILOVER_DRILL=true` fixture 中
 
 1,000 会话试验已完成恢复路径验证：`resume_attempts=1000`、`resume_success=1000`、`resume_failures=0`、收敛通过；但只完成编辑 485/1000，`edit_failures=515`、`unexpected_disconnects=513`，即使 `resume-settle=10s` 仍不足以宣称 Failover 稳定。JOIN P95 22.945ms，编辑 ACK P95 26.707ms。下一步必须继续增加接管稳定等待并区分计划内旧连接关闭与真正恢复失败，不能直接推进 5,000 Failover 或 10,000。随后对 50 会话增加 `resume-settle=120s` 并启用 2 次 EDIT 重试，结果仍为 `resume_success=50/50` 但编辑仅 26/50；这表明问题不是单纯等待时长，而是 node-b 接管后的 owner 路由/错误响应需要继续诊断。客户端现在会消费服务端 `error` 消息并对瞬时 EDIT 错误做有限重试，避免把服务端拒绝误报成 ACK 超时。10 会话小规模复测（`resume-settle=30s`、2 次编辑重试）通过：`resume_success=10/10`、编辑 10/10、`edit_failures=0`、`unexpected_disconnects=0`。因此问题在更高并发的 owner handoff/房间恢复压力下出现，不能用 10 会话结果外推 5,000。随后另一轮 50 会话（同样 `resume-settle=30s`、无编辑重试）再次通过：`resume_success=50/50`、编辑 50/50、`edit_failures=0`、`unexpected_disconnects=0`。这说明 50 会话结果存在时序敏感性，必须用重复轮次和更大规模原始结果判断，不能把单轮通过当作稳定性证明。
 
-5,000 Failover 复测尚未进入 WebTransport JOIN：准备并发 1 的运行持续约 27 分钟仍停留在 REST 准备阶段，已取消；准备并发 4、租约 30s 的重跑在用户 1,113 的权限授予阶段返回 500，也已取消。客户端现加入 `prepare-retries`（默认 1 次退避），下一轮需先验证准备阶段可重复完成，再触发 5,000 Owner Failover。
+5,000 Failover 复测尚未进入 WebTransport JOIN：准备并发 1 的运行持续约 27 分钟仍停留在 REST 准备阶段，已取消；准备并发 4、租约 30s 的重跑在用户 1,113 的权限授予阶段返回 500，也已取消。客户端现加入 `prepare-retries`（默认 1 次退避），下一轮需先验证准备阶段可重复完成，再触发 5,000 Owner Failover。带 `prepare-retries=2` 的重跑已将准备耗时降至约 381s，并完成 4,999/5,000 JOIN；唯一失败为 `owner redirect loop`，尚未进入 Failover。`connect-retries` 现已扩展到 owner redirect loop 和 handoff 错误，下一轮可直接重跑最后 1 个边界失败。
 
 5,000 重试稳定后对 Go Failover 可测性的评估：
 
