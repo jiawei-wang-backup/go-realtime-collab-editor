@@ -40,6 +40,8 @@ type config struct {
 	documents          int
 	prepareConcurrency int
 	prepareRetries     int
+	prepareBatchSize   int
+	prepareBatchDelay  time.Duration
 	ramp               time.Duration
 	online             time.Duration
 	editInterval       time.Duration
@@ -51,6 +53,15 @@ type config struct {
 	resumeCount        int
 	resumeDelay        time.Duration
 	resumeSettle       time.Duration
+	prepareOnly        bool
+	preparedManifest   string
+}
+
+type preparationManifest struct {
+	Clients   int      `json:"clients"`
+	Documents int      `json:"documents"`
+	Users     []string `json:"users"`
+	DocIDs    []string `json:"doc_ids"`
 }
 
 type report struct {
@@ -58,6 +69,8 @@ type report struct {
 	Documents                     int               `json:"documents"`
 	PreparationConcurrency        int               `json:"preparation_concurrency"`
 	PreparationRetries            int               `json:"preparation_retries"`
+	PreparationBatchSize          int               `json:"preparation_batch_size"`
+	PreparationBatchDelayMs       int64             `json:"preparation_batch_delay_ms"`
 	PreparationSeconds            float64           `json:"preparation_seconds"`
 	JoinSuccess                   int64             `json:"join_success"`
 	JoinFailures                  int64             `json:"join_failures"`
@@ -171,6 +184,31 @@ func (tracker *convergenceTracker) snapshot() (bool, map[string]uint64, map[stri
 	return len(problems) == 0, versions, contents, problems
 }
 
+func runIndexedBatched(ctx context.Context, count, concurrency, batchSize int, batchDelay time.Duration, work func(int) error) error {
+	if batchSize <= 0 || batchSize > count {
+		batchSize = count
+	}
+	for start := 0; start < count; start += batchSize {
+		end := start + batchSize
+		if end > count {
+			end = count
+		}
+		if err := runIndexed(ctx, end-start, concurrency, func(index int) error {
+			return work(start + index)
+		}); err != nil {
+			return err
+		}
+		if end < count && batchDelay > 0 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(batchDelay):
+			}
+		}
+	}
+	return nil
+}
+
 func retryPreparation(ctx context.Context, retries int, work func() error) error {
 	for attempt := 0; ; attempt++ {
 		err := work()
@@ -253,46 +291,79 @@ func run() error {
 	defer cancel()
 
 	prepStart := time.Now()
-	ownerToken, err := registerAndLogin(ctx, cfg.httpClient, cfg.apiURL, cfg.prefix+"-owner", cfg.password)
-	if err != nil {
-		return fmt.Errorf("register owner: %w", err)
-	}
-	docs := make([]string, cfg.documents)
-	for i := range docs {
-		docs[i] = fmt.Sprintf("wt-load-%s-%d", randomID(), i)
-	}
-	if err := runIndexed(ctx, len(docs), cfg.prepareConcurrency, func(i int) error {
-		if err := retryPreparation(ctx, cfg.prepareRetries, func() error {
-			return createDocument(ctx, cfg.httpClient, cfg.apiURL, ownerToken, docs[i])
-		}); err != nil {
-			return fmt.Errorf("create document %s: %w", docs[i], err)
-		}
-		return nil
-	}); err != nil {
-		return err
-	}
-	users := make([]string, cfg.clients)
-	tokens := make([]string, cfg.clients)
-	for i := range users {
-		users[i] = fmt.Sprintf("%s-user-%d-%s", cfg.prefix, i, randomID())
-	}
-	if err := runIndexed(ctx, len(users), cfg.prepareConcurrency, func(i int) error {
-		var err error
-		err = retryPreparation(ctx, cfg.prepareRetries, func() error {
-			tokens[i], err = registerAndLogin(ctx, cfg.httpClient, cfg.apiURL, users[i], cfg.password)
-			return err
-		})
+	var docs, users, tokens []string
+	if cfg.preparedManifest != "" && !cfg.prepareOnly {
+		manifest, err := readPreparationManifest(cfg.preparedManifest)
 		if err != nil {
-			return fmt.Errorf("register user %d: %w", i, err)
+			return err
 		}
-		if err := retryPreparation(ctx, cfg.prepareRetries, func() error {
-			return grantWrite(ctx, cfg.httpClient, cfg.apiURL, ownerToken, tokens[i], docs[i%len(docs)])
+		docs, users = manifest.DocIDs, manifest.Users
+		if len(docs) != cfg.documents || len(users) != cfg.clients {
+			return fmt.Errorf("prepared manifest counts mismatch: docs=%d/%d users=%d/%d", len(docs), cfg.documents, len(users), cfg.clients)
+		}
+		tokens = make([]string, len(users))
+		if err := runIndexedBatched(ctx, len(users), cfg.prepareConcurrency, cfg.prepareBatchSize, cfg.prepareBatchDelay, func(i int) error {
+			var loginErr error
+			loginErr = retryPreparation(ctx, cfg.prepareRetries, func() error {
+				tokens[i], loginErr = loginExisting(ctx, cfg.httpClient, cfg.apiURL, users[i], cfg.password)
+				return loginErr
+			})
+			if loginErr != nil {
+				return fmt.Errorf("login prepared user %d: %w", i, loginErr)
+			}
+			return nil
 		}); err != nil {
-			return fmt.Errorf("grant user %d: %w", i, err)
+			return err
 		}
-		return nil
-	}); err != nil {
-		return err
+	} else {
+		ownerToken, err := registerAndLogin(ctx, cfg.httpClient, cfg.apiURL, cfg.prefix+"-owner", cfg.password)
+		if err != nil {
+			return fmt.Errorf("register owner: %w", err)
+		}
+		docs = make([]string, cfg.documents)
+		for i := range docs {
+			docs[i] = fmt.Sprintf("wt-load-%s-%d", randomID(), i)
+		}
+		if err := runIndexedBatched(ctx, len(docs), cfg.prepareConcurrency, cfg.prepareBatchSize, cfg.prepareBatchDelay, func(i int) error {
+			if err := retryPreparation(ctx, cfg.prepareRetries, func() error {
+				return createDocument(ctx, cfg.httpClient, cfg.apiURL, ownerToken, docs[i])
+			}); err != nil {
+				return fmt.Errorf("create document %s: %w", docs[i], err)
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+		users = make([]string, cfg.clients)
+		tokens = make([]string, cfg.clients)
+		for i := range users {
+			users[i] = fmt.Sprintf("%s-user-%d-%s", cfg.prefix, i, randomID())
+		}
+		if err := runIndexedBatched(ctx, len(users), cfg.prepareConcurrency, cfg.prepareBatchSize, cfg.prepareBatchDelay, func(i int) error {
+			var err error
+			err = retryPreparation(ctx, cfg.prepareRetries, func() error {
+				tokens[i], err = registerAndLogin(ctx, cfg.httpClient, cfg.apiURL, users[i], cfg.password)
+				return err
+			})
+			if err != nil {
+				return fmt.Errorf("register user %d: %w", i, err)
+			}
+			if err := retryPreparation(ctx, cfg.prepareRetries, func() error {
+				return grantWrite(ctx, cfg.httpClient, cfg.apiURL, ownerToken, tokens[i], docs[i%len(docs)])
+			}); err != nil {
+				return fmt.Errorf("grant user %d: %w", i, err)
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+		if cfg.prepareOnly {
+			if err := writePreparationManifest(cfg.preparedManifest, preparationManifest{Clients: len(users), Documents: len(docs), Users: users, DocIDs: docs}); err != nil {
+				return err
+			}
+			fmt.Printf("preparation_manifest=%s users=%d documents=%d\n", cfg.preparedManifest, len(users), len(docs))
+			return nil
+		}
 	}
 	prepSeconds := time.Since(prepStart).Seconds()
 
@@ -338,7 +409,7 @@ func run() error {
 	}
 
 	if len(sessions) != cfg.clients {
-		report := report{Clients: cfg.clients, Documents: cfg.documents, PreparationConcurrency: cfg.prepareConcurrency, PreparationRetries: cfg.prepareRetries, PreparationSeconds: prepSeconds, EditRetries: cfg.editRetries, EditErrorSamples: editErrorSamples, JoinSuccess: joins.Load(), JoinFailures: joinFailures.Load(), JoinRetries: joinRetries.Load(), ResumeErrorSamples: resumeErrorSamples, JoinErrorSamples: joinErrorSamples, Redirects: redirects.Load(), LogicalSessions: len(sessions), TransportInstances: len(sessions), UnderlyingConnectionsMeasured: false}
+		report := report{Clients: cfg.clients, Documents: cfg.documents, PreparationConcurrency: cfg.prepareConcurrency, PreparationRetries: cfg.prepareRetries, PreparationBatchSize: cfg.prepareBatchSize, PreparationBatchDelayMs: cfg.prepareBatchDelay.Milliseconds(), PreparationSeconds: prepSeconds, EditRetries: cfg.editRetries, EditErrorSamples: editErrorSamples, JoinSuccess: joins.Load(), JoinFailures: joinFailures.Load(), JoinRetries: joinRetries.Load(), ResumeErrorSamples: resumeErrorSamples, JoinErrorSamples: joinErrorSamples, Redirects: redirects.Load(), LogicalSessions: len(sessions), TransportInstances: len(sessions), UnderlyingConnectionsMeasured: false}
 		closeSessions(sessions)
 		return emitReport(report, fmt.Errorf("join incomplete: success=%d target=%d", len(sessions), cfg.clients))
 	}
@@ -383,7 +454,7 @@ func run() error {
 		go resumed.receive(&disconnects, &remoteUpdates, &maxObservedVersion, tracker)
 	}
 
-	report := report{Clients: cfg.clients, Documents: cfg.documents, PreparationConcurrency: cfg.prepareConcurrency, PreparationRetries: cfg.prepareRetries, PreparationSeconds: prepSeconds, EditRetries: cfg.editRetries, EditErrorSamples: editErrorSamples, JoinSuccess: joins.Load(), JoinFailures: joinFailures.Load(), JoinRetries: joinRetries.Load(), ResumeAttempts: resumeAttempts.Load(), ResumeSuccess: resumeSuccess.Load(), ResumeFailures: resumeFailures.Load(), ResyncCount: resyncCount.Load(), ResumeErrorSamples: resumeErrorSamples, JoinErrorSamples: joinErrorSamples, Redirects: redirects.Load(), LogicalSessions: len(sessions), TransportInstances: len(sessions), UnderlyingConnectionsMeasured: false}
+	report := report{Clients: cfg.clients, Documents: cfg.documents, PreparationConcurrency: cfg.prepareConcurrency, PreparationRetries: cfg.prepareRetries, PreparationBatchSize: cfg.prepareBatchSize, PreparationBatchDelayMs: cfg.prepareBatchDelay.Milliseconds(), PreparationSeconds: prepSeconds, EditRetries: cfg.editRetries, EditErrorSamples: editErrorSamples, JoinSuccess: joins.Load(), JoinFailures: joinFailures.Load(), JoinRetries: joinRetries.Load(), ResumeAttempts: resumeAttempts.Load(), ResumeSuccess: resumeSuccess.Load(), ResumeFailures: resumeFailures.Load(), ResyncCount: resyncCount.Load(), ResumeErrorSamples: resumeErrorSamples, JoinErrorSamples: joinErrorSamples, Redirects: redirects.Load(), LogicalSessions: len(sessions), TransportInstances: len(sessions), UnderlyingConnectionsMeasured: false}
 	if resumeFailures.Load() > 0 {
 		closeSessions(sessions)
 		return emitReport(report, fmt.Errorf("resume incomplete: success=%d target=%d", resumeSuccess.Load(), resumeAttempts.Load()))
@@ -488,6 +559,8 @@ func parseConfig() (config, error) {
 	flag.IntVar(&cfg.documents, "documents", intEnv("WT_LOAD_DOCUMENTS", 200), "documents")
 	flag.IntVar(&cfg.prepareConcurrency, "prepare-concurrency", intEnv("WT_LOAD_PREPARE_CONCURRENCY", 4), "bounded REST preparation concurrency")
 	flag.IntVar(&cfg.prepareRetries, "prepare-retries", intEnv("WT_LOAD_PREPARE_RETRIES", 1), "retries for transient REST preparation failures")
+	flag.IntVar(&cfg.prepareBatchSize, "prepare-batch-size", intEnv("WT_LOAD_PREPARE_BATCH_SIZE", 400), "accounts/documents per preparation rate-limit batch")
+	flag.DurationVar(&cfg.prepareBatchDelay, "prepare-batch-delay", durationEnv("WT_LOAD_PREPARE_BATCH_DELAY", 35*time.Second), "delay between preparation batches")
 	flag.DurationVar(&cfg.ramp, "ramp", durationEnv("WT_LOAD_RAMP", 0), "ramp duration")
 	flag.DurationVar(&cfg.online, "online", durationEnv("WT_LOAD_ONLINE", time.Minute), "online duration")
 	flag.DurationVar(&cfg.editInterval, "edit-interval", durationEnv("WT_LOAD_EDIT_INTERVAL", 0), "per-session edit interval")
@@ -499,11 +572,22 @@ func parseConfig() (config, error) {
 	flag.IntVar(&cfg.resumeCount, "resume-count", intEnv("WT_LOAD_RESUME_COUNT", 0), "sessions to reconnect with RESUME before online edits")
 	flag.DurationVar(&cfg.resumeDelay, "resume-delay", durationEnv("WT_LOAD_RESUME_DELAY", 0), "delay before planned RESUME reconnect")
 	flag.DurationVar(&cfg.resumeSettle, "resume-settle", durationEnv("WT_LOAD_RESUME_SETTLE", 0), "delay after RESUME before online edits")
+	flag.BoolVar(&cfg.prepareOnly, "prepare-only", false, "prepare accounts/documents/permissions and write manifest, then exit")
+	flag.StringVar(&cfg.preparedManifest, "prepared-manifest", os.Getenv("WT_LOAD_PREPARED_MANIFEST"), "reuse a preparation manifest and skip registration/provisioning")
 	flag.Parse()
 	if cfg.apiURL == "" || *endpoints == "" || cfg.caFile == "" || cfg.password == "" {
 		return cfg, errors.New("api, endpoints, ca and password are required")
 	}
-	if cfg.clients < 1 || cfg.documents < 1 || cfg.prepareConcurrency < 1 || cfg.prepareRetries < 0 || cfg.ramp < 0 || cfg.online <= 0 || cfg.editCount < 0 || cfg.editRetries < 0 || cfg.editInterval < 0 || cfg.connectRetries < 0 || cfg.resumeCount < 0 || cfg.resumeCount > cfg.clients || cfg.resumeDelay < 0 || cfg.resumeSettle < 0 {
+	if cfg.prepareOnly && cfg.preparedManifest == "" {
+		return cfg, errors.New("prepare-only requires prepared-manifest")
+	}
+	if cfg.prepareOnly && cfg.preparedManifest != "" {
+		// The manifest path is an output in prepare-only mode and an input otherwise.
+	}
+	if !cfg.prepareOnly && cfg.preparedManifest != "" && cfg.resumeCount > 0 {
+		return cfg, errors.New("prepared-manifest cannot be combined with resume-count")
+	}
+	if cfg.clients < 1 || cfg.documents < 1 || cfg.prepareConcurrency < 1 || cfg.prepareRetries < 0 || cfg.prepareBatchSize < 1 || cfg.prepareBatchDelay < 0 || cfg.ramp < 0 || cfg.online <= 0 || cfg.editCount < 0 || cfg.editRetries < 0 || cfg.editInterval < 0 || cfg.connectRetries < 0 || cfg.resumeCount < 0 || cfg.resumeCount > cfg.clients || cfg.resumeDelay < 0 || cfg.resumeSettle < 0 {
 		return cfg, errors.New("invalid load configuration")
 	}
 	maxUsername := fmt.Sprintf("%s-user-%d-%s", cfg.prefix, cfg.clients-1, "000000000000")
@@ -864,6 +948,45 @@ func registerAndLogin(ctx context.Context, client *http.Client, apiURL, username
 		return "", errors.New("login returned empty access token")
 	}
 	return response.AccessToken, nil
+}
+
+func loginExisting(ctx context.Context, client *http.Client, apiURL, username, password string) (string, error) {
+	var response struct {
+		AccessToken string `json:"access_token"`
+	}
+	if err := jsonRequest(ctx, client, http.MethodPost, apiURL+"/api/auth/login", "", map[string]string{"username": username, "password": password}, &response); err != nil {
+		return "", err
+	}
+	if response.AccessToken == "" {
+		return "", errors.New("login returned empty access token")
+	}
+	return response.AccessToken, nil
+}
+
+func readPreparationManifest(path string) (preparationManifest, error) {
+	payload, err := os.ReadFile(path)
+	if err != nil {
+		return preparationManifest{}, fmt.Errorf("read preparation manifest: %w", err)
+	}
+	var manifest preparationManifest
+	if err := json.Unmarshal(payload, &manifest); err != nil {
+		return preparationManifest{}, fmt.Errorf("decode preparation manifest: %w", err)
+	}
+	if manifest.Clients < 1 || manifest.Documents < 1 || len(manifest.Users) != manifest.Clients || len(manifest.DocIDs) != manifest.Documents {
+		return preparationManifest{}, errors.New("invalid preparation manifest counts")
+	}
+	return manifest, nil
+}
+
+func writePreparationManifest(path string, manifest preparationManifest) error {
+	payload, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(path, append(payload, '\n'), 0o600); err != nil {
+		return fmt.Errorf("write preparation manifest: %w", err)
+	}
+	return nil
 }
 
 func createDocument(ctx context.Context, client *http.Client, apiURL, token, documentID string) error {

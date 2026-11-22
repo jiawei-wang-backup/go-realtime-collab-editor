@@ -173,6 +173,8 @@ bash scripts/collect-collab-metrics.sh
 
 ### 10,000 会话
 
+2026 年 11 月 22 日的实测结果、采样覆盖及客户端关闭事件说明见[万人在线实测记录](../performance/2026-11-22-webtransport-10k-acceptance.md)。
+
 初始工作负载冻结为：
 
 ```text
