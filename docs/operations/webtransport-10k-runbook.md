@@ -76,6 +76,8 @@ Mac 本地轻量客户端基线：
 
 Mac Go RESUME smoke 已完成：2 个会话、1 个文档各先 JOIN，再执行一次计划内断线重连；`resume-count=2`，结果为 `resume_attempts=2`、`resume_success=2`、`resume_failures=0`、`resync_count=0`，随后编辑 2/2、内容/版本收敛通过、意外断线 0。该 smoke 验证了真实 WebTransport `AUTH → RESUME → SYNC → EDIT` 路径；尚未覆盖 Owner 进程失效触发的 `RESYNC_REQUIRED`。
 
+Mac Owner Failover smoke 已完成：在 `OWNER_FAILOVER_DRILL=true` fixture 中终止 node-a，保持 node-b 继续运行；node-b 日志确认接管文档 ownership 并完成 room recovery，Go 客户端通过备用 endpoint 完成 `resume_attempts=2`、`resume_success=2`、`resume_failures=0`，随后编辑 2/2、内容/版本收敛通过、意外断线 0。该轮 `resync_count=0`，因为文档历史仍在可增量 SYNC 范围内；`RESYNC_REQUIRED` 仍需单独制造 snapshot/history floor 场景。
+
 5,000 重试稳定后对 Go Failover 可测性的评估：
 
 - 现有 Go 客户端没有保存 session token/doc version 后重新建立 WebTransport 会话的状态机，因此不能直接测量 Owner 失效后的自动 `RESUME`。

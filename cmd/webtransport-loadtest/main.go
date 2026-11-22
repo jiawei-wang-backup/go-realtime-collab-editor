@@ -47,6 +47,7 @@ type config struct {
 	password           string
 	prefix             string
 	resumeCount        int
+	resumeDelay        time.Duration
 }
 
 type report struct {
@@ -61,6 +62,7 @@ type report struct {
 	ResumeSuccess                 int64             `json:"resume_success"`
 	ResumeFailures                int64             `json:"resume_failures"`
 	ResyncCount                   int64             `json:"resync_count"`
+	ResumeErrorSamples            map[string]int    `json:"resume_error_samples,omitempty"`
 	JoinErrorSamples              map[string]int    `json:"join_error_samples,omitempty"`
 	Redirects                     int64             `json:"redirects"`
 	Edits                         int64             `json:"edits"`
@@ -268,6 +270,7 @@ func run() error {
 	var editLatencies []time.Duration
 	var joinMu, editMu, joinErrorMu sync.Mutex
 	joinErrorSamples := make(map[string]int)
+	resumeErrorSamples := make(map[string]int)
 	var joins, joinFailures, joinRetries, redirects, edits, editFailures, remoteUpdates, disconnects atomic.Int64
 	var resumeAttempts, resumeSuccess, resumeFailures, resyncCount atomic.Int64
 	var maxObservedVersion atomic.Uint64
@@ -304,9 +307,17 @@ func run() error {
 	}
 
 	if len(sessions) != cfg.clients {
-		report := report{Clients: cfg.clients, Documents: cfg.documents, PreparationConcurrency: cfg.prepareConcurrency, PreparationSeconds: prepSeconds, JoinSuccess: joins.Load(), JoinFailures: joinFailures.Load(), JoinRetries: joinRetries.Load(), JoinErrorSamples: joinErrorSamples, Redirects: redirects.Load(), LogicalSessions: len(sessions), TransportInstances: len(sessions), UnderlyingConnectionsMeasured: false}
+		report := report{Clients: cfg.clients, Documents: cfg.documents, PreparationConcurrency: cfg.prepareConcurrency, PreparationSeconds: prepSeconds, JoinSuccess: joins.Load(), JoinFailures: joinFailures.Load(), JoinRetries: joinRetries.Load(), ResumeErrorSamples: resumeErrorSamples, JoinErrorSamples: joinErrorSamples, Redirects: redirects.Load(), LogicalSessions: len(sessions), TransportInstances: len(sessions), UnderlyingConnectionsMeasured: false}
 		closeSessions(sessions)
 		return emitReport(report, fmt.Errorf("join incomplete: success=%d target=%d", len(sessions), cfg.clients))
+	}
+	if cfg.resumeCount > 0 && cfg.resumeDelay > 0 {
+		select {
+		case <-ctx.Done():
+			closeSessions(sessions)
+			return ctx.Err()
+		case <-time.After(cfg.resumeDelay):
+		}
 	}
 	for i := 0; i < cfg.resumeCount; i++ {
 		resumeAttempts.Add(1)
@@ -325,6 +336,9 @@ func run() error {
 		resumed, _, resynced, err := resume(ctx, cfg, old.token, old.docID, lastVersion, lastContent)
 		if err != nil {
 			resumeFailures.Add(1)
+			if len(resumeErrorSamples) < 5 {
+				resumeErrorSamples[err.Error()]++
+			}
 			continue
 		}
 		if resynced {
@@ -335,7 +349,7 @@ func run() error {
 		go resumed.receive(&disconnects, &remoteUpdates, &maxObservedVersion, tracker)
 	}
 
-	report := report{Clients: cfg.clients, Documents: cfg.documents, PreparationConcurrency: cfg.prepareConcurrency, PreparationSeconds: prepSeconds, JoinSuccess: joins.Load(), JoinFailures: joinFailures.Load(), JoinRetries: joinRetries.Load(), ResumeAttempts: resumeAttempts.Load(), ResumeSuccess: resumeSuccess.Load(), ResumeFailures: resumeFailures.Load(), ResyncCount: resyncCount.Load(), JoinErrorSamples: joinErrorSamples, Redirects: redirects.Load(), LogicalSessions: len(sessions), TransportInstances: len(sessions), UnderlyingConnectionsMeasured: false}
+	report := report{Clients: cfg.clients, Documents: cfg.documents, PreparationConcurrency: cfg.prepareConcurrency, PreparationSeconds: prepSeconds, JoinSuccess: joins.Load(), JoinFailures: joinFailures.Load(), JoinRetries: joinRetries.Load(), ResumeAttempts: resumeAttempts.Load(), ResumeSuccess: resumeSuccess.Load(), ResumeFailures: resumeFailures.Load(), ResyncCount: resyncCount.Load(), ResumeErrorSamples: resumeErrorSamples, JoinErrorSamples: joinErrorSamples, Redirects: redirects.Load(), LogicalSessions: len(sessions), TransportInstances: len(sessions), UnderlyingConnectionsMeasured: false}
 	if resumeFailures.Load() > 0 {
 		closeSessions(sessions)
 		return emitReport(report, fmt.Errorf("resume incomplete: success=%d target=%d", resumeSuccess.Load(), resumeAttempts.Load()))
@@ -423,11 +437,12 @@ func parseConfig() (config, error) {
 	flag.StringVar(&cfg.password, "password", os.Getenv("WT_LOAD_PASSWORD"), "test password")
 	flag.StringVar(&cfg.prefix, "prefix", envOr("WT_LOAD_PREFIX", "wt-load"), "account prefix")
 	flag.IntVar(&cfg.resumeCount, "resume-count", intEnv("WT_LOAD_RESUME_COUNT", 0), "sessions to reconnect with RESUME before online edits")
+	flag.DurationVar(&cfg.resumeDelay, "resume-delay", durationEnv("WT_LOAD_RESUME_DELAY", 0), "delay before planned RESUME reconnect")
 	flag.Parse()
 	if cfg.apiURL == "" || *endpoints == "" || cfg.caFile == "" || cfg.password == "" {
 		return cfg, errors.New("api, endpoints, ca and password are required")
 	}
-	if cfg.clients < 1 || cfg.documents < 1 || cfg.prepareConcurrency < 1 || cfg.ramp < 0 || cfg.online <= 0 || cfg.editCount < 0 || cfg.editInterval < 0 || cfg.connectRetries < 0 || cfg.resumeCount < 0 || cfg.resumeCount > cfg.clients {
+	if cfg.clients < 1 || cfg.documents < 1 || cfg.prepareConcurrency < 1 || cfg.ramp < 0 || cfg.online <= 0 || cfg.editCount < 0 || cfg.editInterval < 0 || cfg.connectRetries < 0 || cfg.resumeCount < 0 || cfg.resumeCount > cfg.clients || cfg.resumeDelay < 0 {
 		return cfg, errors.New("invalid load configuration")
 	}
 	maxUsername := fmt.Sprintf("%s-user-%d-%s", cfg.prefix, cfg.clients-1, "000000000000")
@@ -522,6 +537,15 @@ func connectMode(ctx context.Context, cfg config, token, docID, messageType stri
 		_, wtSession, err := transport.Dial(ctx, endpoint, http.Header{"Origin": []string{cfg.origin}})
 		if err != nil {
 			_ = transport.Close()
+			for _, candidate := range cfg.endpoints {
+				if _, seen := visited[candidate]; !seen {
+					endpoint = candidate
+					continue
+				}
+			}
+			if len(visited) < len(cfg.endpoints) {
+				continue
+			}
 			return nil, redirects, fmt.Errorf("webtransport dial %s: %w", endpoint, err)
 		}
 		stream, err := wtSession.OpenStreamSync(ctx)
