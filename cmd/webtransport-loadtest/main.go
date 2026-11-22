@@ -48,6 +48,7 @@ type config struct {
 	prefix             string
 	resumeCount        int
 	resumeDelay        time.Duration
+	resumeSettle       time.Duration
 }
 
 type report struct {
@@ -333,7 +334,7 @@ func run() error {
 			resumeFailures.Add(1)
 			continue
 		}
-		resumed, _, resynced, err := resume(ctx, cfg, old.token, old.docID, lastVersion, lastContent)
+		resumed, resumeRedirects, resynced, err := resume(ctx, cfg, old.token, old.docID, lastVersion, lastContent)
 		if err != nil {
 			resumeFailures.Add(1)
 			if len(resumeErrorSamples) < 5 {
@@ -344,6 +345,9 @@ func run() error {
 		if resynced {
 			resyncCount.Add(1)
 		}
+		if resumeRedirects > 0 && len(cfg.endpoints) > 1 {
+			cfg.endpoints = append(append([]string(nil), cfg.endpoints[1:]...), cfg.endpoints[0])
+		}
 		resumeSuccess.Add(1)
 		sessions[i] = resumed
 		go resumed.receive(&disconnects, &remoteUpdates, &maxObservedVersion, tracker)
@@ -353,6 +357,14 @@ func run() error {
 	if resumeFailures.Load() > 0 {
 		closeSessions(sessions)
 		return emitReport(report, fmt.Errorf("resume incomplete: success=%d target=%d", resumeSuccess.Load(), resumeAttempts.Load()))
+	}
+	if cfg.resumeSettle > 0 {
+		select {
+		case <-ctx.Done():
+			closeSessions(sessions)
+			return ctx.Err()
+		case <-time.After(cfg.resumeSettle):
+		}
 	}
 
 	start := time.Now()
@@ -438,11 +450,12 @@ func parseConfig() (config, error) {
 	flag.StringVar(&cfg.prefix, "prefix", envOr("WT_LOAD_PREFIX", "wt-load"), "account prefix")
 	flag.IntVar(&cfg.resumeCount, "resume-count", intEnv("WT_LOAD_RESUME_COUNT", 0), "sessions to reconnect with RESUME before online edits")
 	flag.DurationVar(&cfg.resumeDelay, "resume-delay", durationEnv("WT_LOAD_RESUME_DELAY", 0), "delay before planned RESUME reconnect")
+	flag.DurationVar(&cfg.resumeSettle, "resume-settle", durationEnv("WT_LOAD_RESUME_SETTLE", 0), "delay after RESUME before online edits")
 	flag.Parse()
 	if cfg.apiURL == "" || *endpoints == "" || cfg.caFile == "" || cfg.password == "" {
 		return cfg, errors.New("api, endpoints, ca and password are required")
 	}
-	if cfg.clients < 1 || cfg.documents < 1 || cfg.prepareConcurrency < 1 || cfg.ramp < 0 || cfg.online <= 0 || cfg.editCount < 0 || cfg.editInterval < 0 || cfg.connectRetries < 0 || cfg.resumeCount < 0 || cfg.resumeCount > cfg.clients || cfg.resumeDelay < 0 {
+	if cfg.clients < 1 || cfg.documents < 1 || cfg.prepareConcurrency < 1 || cfg.ramp < 0 || cfg.online <= 0 || cfg.editCount < 0 || cfg.editInterval < 0 || cfg.connectRetries < 0 || cfg.resumeCount < 0 || cfg.resumeCount > cfg.clients || cfg.resumeDelay < 0 || cfg.resumeSettle < 0 {
 		return cfg, errors.New("invalid load configuration")
 	}
 	maxUsername := fmt.Sprintf("%s-user-%d-%s", cfg.prefix, cfg.clients-1, "000000000000")
